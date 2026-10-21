@@ -1,11 +1,17 @@
 package com.leanbitlab.leantype.gif.storage
 
 import android.content.Context
+import android.graphics.Bitmap
+import android.graphics.BitmapFactory
+import android.graphics.Canvas
 import android.net.Uri
+import android.os.Build
 import android.provider.OpenableColumns
 import com.leanbitlab.leantype.gif.Contract
 import com.leanbitlab.leantype.gif.GifItem
+import java.io.ByteArrayOutputStream
 import java.io.File
+import java.io.FileInputStream
 import java.io.FileOutputStream
 import java.util.zip.ZipInputStream
 
@@ -43,11 +49,112 @@ object LocalMediaManager {
 
     private fun detectKind(file: File): Int {
         val name = file.name.lowercase()
+        val ext = file.extension.lowercase()
         return when {
-            name.contains("sticker") -> Contract.KIND_STICKER
             name.contains("meme") -> Contract.KIND_MEME
             name.contains("emoji") -> Contract.KIND_ANIMATED_EMOJI
-            else -> Contract.KIND_GIF
+            ext == "webp" || name.contains("sticker") -> Contract.KIND_STICKER
+            ext == "gif" -> Contract.KIND_GIF
+            else -> Contract.KIND_STICKER
+        }
+    }
+
+    fun isAnimatedWebp(file: File): Boolean {
+        if (!file.exists() || file.length() < 30) return false
+        return try {
+            val header = ByteArray(64)
+            val read = FileInputStream(file).use { it.read(header) }
+            if (read >= 21 &&
+                header[0] == 'R'.code.toByte() && header[1] == 'I'.code.toByte() &&
+                header[2] == 'F'.code.toByte() && header[3] == 'F'.code.toByte() &&
+                header[8] == 'W'.code.toByte() && header[9] == 'E'.code.toByte() &&
+                header[10] == 'B'.code.toByte() && header[11] == 'P'.code.toByte()
+            ) {
+                if (header[12] == 'V'.code.toByte() && header[13] == 'P'.code.toByte() &&
+                    header[14] == '8'.code.toByte() && header[15] == 'X'.code.toByte()
+                ) {
+                    val flags = header[20].toInt()
+                    return (flags and 0x02) != 0
+                }
+            }
+            false
+        } catch (_: Exception) {
+            false
+        }
+    }
+
+    fun convertToWebpSticker(inputFile: File, outputFile: File): Boolean {
+        return try {
+            val options = BitmapFactory.Options().apply {
+                inJustDecodeBounds = true
+            }
+            BitmapFactory.decodeFile(inputFile.absolutePath, options)
+            val w = options.outWidth
+            val h = options.outHeight
+            if (w <= 0 || h <= 0) return false
+
+            val maxDim = maxOf(w, h)
+            var sampleSize = 1
+            while (maxDim / sampleSize > 1024) {
+                sampleSize *= 2
+            }
+
+            val decodeOptions = BitmapFactory.Options().apply {
+                inSampleSize = sampleSize
+                inPreferredConfig = Bitmap.Config.ARGB_8888
+            }
+            val bitmap = BitmapFactory.decodeFile(inputFile.absolutePath, decodeOptions) ?: return false
+
+            val currMax = maxOf(bitmap.width, bitmap.height)
+            val scale = 512f / currMax
+            val targetW = (bitmap.width * scale).toInt().coerceIn(1, 512)
+            val targetH = (bitmap.height * scale).toInt().coerceIn(1, 512)
+
+            val scaled = if (targetW != bitmap.width || targetH != bitmap.height) {
+                Bitmap.createScaledBitmap(bitmap, targetW, targetH, true)
+            } else {
+                bitmap
+            }
+
+            // WhatsApp and Telegram sticker spec requires exact 512x512 canvas with transparent padding
+            val canvasBitmap = Bitmap.createBitmap(512, 512, Bitmap.Config.ARGB_8888)
+            val canvas = Canvas(canvasBitmap)
+            val left = (512 - targetW) / 2f
+            val top = (512 - targetH) / 2f
+            canvas.drawBitmap(scaled, left, top, null)
+
+            val baos = ByteArrayOutputStream()
+            var quality = 90
+            var compressedBytes: ByteArray
+            while (true) {
+                baos.reset()
+                if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
+                    val format = if (quality == 90 && canvasBitmap.hasAlpha()) {
+                        Bitmap.CompressFormat.WEBP_LOSSLESS
+                    } else {
+                        Bitmap.CompressFormat.WEBP_LOSSY
+                    }
+                    canvasBitmap.compress(format, quality, baos)
+                } else {
+                    @Suppress("DEPRECATION")
+                    canvasBitmap.compress(Bitmap.CompressFormat.WEBP, quality, baos)
+                }
+                compressedBytes = baos.toByteArray()
+                // WhatsApp hard limit for static stickers is 100 KB
+                if (compressedBytes.size <= 100 * 1024 || quality <= 30) {
+                    break
+                }
+                quality -= 15
+            }
+
+            outputFile.writeBytes(compressedBytes)
+
+            if (scaled != bitmap) scaled.recycle()
+            bitmap.recycle()
+            canvasBitmap.recycle()
+            outputFile.exists() && outputFile.length() > 0
+        } catch (_: Exception) {
+            false
         }
     }
 
@@ -67,13 +174,54 @@ object LocalMediaManager {
                 }.lowercase()
                 val rawName = queryDisplayName(context, uri).substringBeforeLast('.')
                 val safeBase = rawName.replace("[^a-zA-Z0-9_-]".toRegex(), "_").ifEmpty { "media" }
-                val targetFile = File(dir, "${safeBase}_${System.currentTimeMillis()}.$ext")
+
+                val tempFile = File(dir, "temp_${System.currentTimeMillis()}.$ext")
                 contentResolver.openInputStream(uri)?.use { input ->
-                    FileOutputStream(targetFile).use { output ->
+                    FileOutputStream(tempFile).use { output ->
                         input.copyTo(output)
                     }
                 }
-                if (targetFile.length() > 32) count++ else targetFile.delete()
+                if (!tempFile.exists() || tempFile.length() < 32) {
+                    tempFile.delete()
+                    return@runCatching
+                }
+
+                // If JPEG or PNG: convert to 512x512 WebP sticker format
+                val targetFile = if (ext in listOf("jpg", "jpeg", "png")) {
+                    val webpFile = File(dir, "${safeBase}_${System.currentTimeMillis()}.webp")
+                    if (convertToWebpSticker(tempFile, webpFile)) {
+                        tempFile.delete()
+                        webpFile
+                    } else {
+                        // Fallback to original
+                        val origFile = File(dir, "${safeBase}_${System.currentTimeMillis()}.$ext")
+                        tempFile.renameTo(origFile)
+                        origFile
+                    }
+                } else if (ext == "webp") {
+                    if (isAnimatedWebp(tempFile)) {
+                        val webpFile = File(dir, "${safeBase}_${System.currentTimeMillis()}.webp")
+                        tempFile.renameTo(webpFile)
+                        webpFile
+                    } else {
+                        // Static WebP: scale down if > 512px
+                        val webpFile = File(dir, "${safeBase}_${System.currentTimeMillis()}.webp")
+                        if (convertToWebpSticker(tempFile, webpFile)) {
+                            tempFile.delete()
+                            webpFile
+                        } else {
+                            tempFile.renameTo(webpFile)
+                            webpFile
+                        }
+                    }
+                } else {
+                    // GIF or others
+                    val finalFile = File(dir, "${safeBase}_${System.currentTimeMillis()}.$ext")
+                    tempFile.renameTo(finalFile)
+                    finalFile
+                }
+
+                if (targetFile.exists() && targetFile.length() > 32) count++ else targetFile.delete()
             }
         }
         return count
@@ -92,11 +240,45 @@ object LocalMediaManager {
                         if (!entry.isDirectory && ext in listOf("gif", "webp", "png", "jpg", "jpeg")) {
                             val rawBase = name.substringAfterLast('/').substringBeforeLast('.')
                             val safeBase = rawBase.replace("[^a-zA-Z0-9_-]".toRegex(), "_").ifEmpty { "pack" }
-                            val targetFile = File(dir, "${safeBase}_${System.currentTimeMillis()}.$ext")
-                            FileOutputStream(targetFile).use { fos ->
+                            val tempFile = File(dir, "temp_${System.currentTimeMillis()}.$ext")
+                            FileOutputStream(tempFile).use { fos ->
                                 zis.copyTo(fos)
                             }
-                            if (targetFile.length() > 32) count++ else targetFile.delete()
+                            if (tempFile.exists() && tempFile.length() > 32) {
+                                val targetFile = if (ext in listOf("jpg", "jpeg", "png")) {
+                                    val webpFile = File(dir, "${safeBase}_${System.currentTimeMillis()}.webp")
+                                    if (convertToWebpSticker(tempFile, webpFile)) {
+                                        tempFile.delete()
+                                        webpFile
+                                    } else {
+                                        val origFile = File(dir, "${safeBase}_${System.currentTimeMillis()}.$ext")
+                                        tempFile.renameTo(origFile)
+                                        origFile
+                                    }
+                                } else if (ext == "webp") {
+                                    if (isAnimatedWebp(tempFile)) {
+                                        val webpFile = File(dir, "${safeBase}_${System.currentTimeMillis()}.webp")
+                                        tempFile.renameTo(webpFile)
+                                        webpFile
+                                    } else {
+                                        val webpFile = File(dir, "${safeBase}_${System.currentTimeMillis()}.webp")
+                                        if (convertToWebpSticker(tempFile, webpFile)) {
+                                            tempFile.delete()
+                                            webpFile
+                                        } else {
+                                            tempFile.renameTo(webpFile)
+                                            webpFile
+                                        }
+                                    }
+                                } else {
+                                    val finalFile = File(dir, "${safeBase}_${System.currentTimeMillis()}.$ext")
+                                    tempFile.renameTo(finalFile)
+                                    finalFile
+                                }
+                                if (targetFile.exists() && targetFile.length() > 32) count++ else targetFile.delete()
+                            } else {
+                                tempFile.delete()
+                            }
                         }
                         zis.closeEntry()
                         entry = zis.nextEntry
@@ -122,7 +304,7 @@ object LocalMediaManager {
         return files.sumOf { if (it.isFile) it.length() else 0L }
     }
 
-    private fun queryDisplayName(context: Context, uri: Uri): String {
+    fun queryDisplayName(context: Context, uri: Uri): String {
         return runCatching {
             context.contentResolver.query(uri, arrayOf(OpenableColumns.DISPLAY_NAME), null, null, null)?.use { cursor ->
                 if (cursor.moveToFirst()) {

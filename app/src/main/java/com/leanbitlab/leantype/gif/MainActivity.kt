@@ -1,7 +1,10 @@
 package com.leanbitlab.leantype.gif
 
+import android.content.Intent
 import android.content.res.Configuration
 import android.graphics.Color
+import android.net.Uri
+import android.os.Build
 import android.os.Bundle
 import android.text.format.Formatter
 import android.view.LayoutInflater
@@ -114,6 +117,85 @@ class MainActivity : AppCompatActivity() {
         recyclerViewMedia.adapter = mediaAdapter
 
         refreshData()
+        handleSendIntent(intent)
+    }
+
+    override fun onNewIntent(intent: Intent) {
+        super.onNewIntent(intent)
+        setIntent(intent)
+        handleSendIntent(intent)
+    }
+
+    private fun handleSendIntent(intent: Intent?) {
+        if (intent == null) return
+        val action = intent.action ?: return
+        if (action != Intent.ACTION_SEND && action != Intent.ACTION_SEND_MULTIPLE) return
+
+        val type = intent.type.orEmpty().lowercase()
+        val uris = mutableListOf<Uri>()
+
+        intent.clipData?.let { clipData ->
+            for (i in 0 until clipData.itemCount) {
+                clipData.getItemAt(i).uri?.let { uris.add(it) }
+            }
+        }
+
+        if (uris.isEmpty()) {
+            if (action == Intent.ACTION_SEND) {
+                val streamUri = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
+                    intent.getParcelableExtra(Intent.EXTRA_STREAM, Uri::class.java)
+                } else {
+                    @Suppress("DEPRECATION")
+                    intent.getParcelableExtra<Uri>(Intent.EXTRA_STREAM)
+                } ?: intent.data
+                streamUri?.let { uris.add(it) }
+            } else if (action == Intent.ACTION_SEND_MULTIPLE) {
+                val streamUris = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
+                    intent.getParcelableArrayListExtra(Intent.EXTRA_STREAM, Uri::class.java)
+                } else {
+                    @Suppress("DEPRECATION")
+                    intent.getParcelableArrayListExtra<Uri>(Intent.EXTRA_STREAM)
+                }
+                if (!streamUris.isNullOrEmpty()) {
+                    uris.addAll(streamUris)
+                }
+            }
+        }
+
+        if (uris.isEmpty()) return
+
+        scope.launch {
+            val imported = withContext(Dispatchers.IO) {
+                var total = 0
+                val fileUris = mutableListOf<Uri>()
+                for (uri in uris) {
+                    if (isZipUri(uri, type)) {
+                        total += LocalMediaManager.importZip(applicationContext, uri)
+                    } else {
+                        fileUris.add(uri)
+                    }
+                }
+                if (fileUris.isNotEmpty()) {
+                    total += LocalMediaManager.importFiles(applicationContext, fileUris)
+                }
+                total
+            }
+
+            if (imported > 0) {
+                Toast.makeText(this@MainActivity, "Imported $imported items", Toast.LENGTH_SHORT).show()
+                refreshData()
+            }
+        }
+    }
+
+    private fun isZipUri(uri: Uri, mimeType: String): Boolean {
+        if (mimeType.contains("zip") || mimeType == "application/octet-stream") {
+            val name = LocalMediaManager.queryDisplayName(this, uri).lowercase()
+            if (name.endsWith(".zip") || name.endsWith(".wastickers")) return true
+            if (mimeType.contains("zip")) return true
+        }
+        val name = LocalMediaManager.queryDisplayName(this, uri).lowercase()
+        return name.endsWith(".zip") || name.endsWith(".wastickers")
     }
 
     override fun onResume() {
