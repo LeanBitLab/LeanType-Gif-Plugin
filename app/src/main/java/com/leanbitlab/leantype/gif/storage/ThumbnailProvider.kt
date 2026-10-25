@@ -36,6 +36,17 @@ class ThumbnailProvider : ContentProvider() {
             throw SecurityException("Malformed thumbnail file name '$lastSegment'")
         }
 
+        // Direct local media resolution: bypasses LRU cache and SQLite row limit for imported media
+        if (lastSegment.startsWith("loc_")) {
+            val localFile = LocalMediaManager.getLocalFileByThumbName(lastSegment, ctx)
+            if (localFile != null && localFile.exists() && localFile.length() >= 32) {
+                if (!validateMagic(localFile)) {
+                    throw FileNotFoundException("Invalid image magic for: $lastSegment")
+                }
+                return ParcelFileDescriptor.open(localFile, ParcelFileDescriptor.MODE_READ_ONLY)
+            }
+        }
+
         val file = registry.getFile(lastSegment)
         if (!file.exists() || file.length() < 32) {
             val registeredUrl = registry.getUrl(lastSegment)

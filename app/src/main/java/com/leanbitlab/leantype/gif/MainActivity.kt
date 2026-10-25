@@ -50,11 +50,14 @@ class MainActivity : AppCompatActivity() {
         onItemClick = { item, file -> showItemDetailsDialog(item, file) }
     )
 
+    private var pendingImportKind: Int? = null
+
     private val pickFilesLauncher = registerForActivityResult(ActivityResultContracts.OpenMultipleDocuments()) { uris ->
         if (uris.isNullOrEmpty()) return@registerForActivityResult
+        val targetKind = pendingImportKind
         scope.launch {
             val imported = withContext(Dispatchers.IO) {
-                LocalMediaManager.importFiles(applicationContext, uris)
+                LocalMediaManager.importFiles(applicationContext, uris, targetKind)
             }
             Toast.makeText(this@MainActivity, "Imported $imported media files", Toast.LENGTH_SHORT).show()
             refreshData()
@@ -102,7 +105,7 @@ class MainActivity : AppCompatActivity() {
         }
 
         btnImportFiles.setOnClickListener {
-            pickFilesLauncher.launch(arrayOf("image/gif", "image/webp", "image/png", "image/jpeg"))
+            showImportCategoryDialog()
         }
 
         btnImportZip.setOnClickListener {
@@ -249,6 +252,18 @@ class MainActivity : AppCompatActivity() {
             .show()
     }
 
+    private fun showImportCategoryDialog() {
+        val categories = arrayOf("Auto-detect", "Sticker", "GIF", "Meme", "Emoji")
+        val kinds = arrayOf(null, Contract.KIND_STICKER, Contract.KIND_GIF, Contract.KIND_MEME, Contract.KIND_ANIMATED_EMOJI)
+        MaterialAlertDialogBuilder(this)
+            .setTitle("Import As Category")
+            .setItems(categories) { _, which ->
+                pendingImportKind = kinds[which]
+                pickFilesLauncher.launch(arrayOf("image/gif", "image/webp", "image/png", "image/jpeg"))
+            }
+            .show()
+    }
+
     private fun showItemDetailsDialog(item: GifItem, file: File) {
         val kindLabel = when (item.kind) {
             Contract.KIND_STICKER -> "Sticker"
@@ -262,10 +277,35 @@ class MainActivity : AppCompatActivity() {
             .setTitle(file.name)
             .setMessage("Type: $kindLabel\nSize: $sizeStr\nPath: ${file.name}")
             .setPositiveButton("Close", null)
+            .setNeutralButton("Change Category") { _, _ ->
+                showCategorySelectDialog(file)
+            }
             .setNegativeButton("Delete") { _, _ ->
                 LocalMediaManager.deleteFile(file)
                 Toast.makeText(this, "Item deleted", Toast.LENGTH_SHORT).show()
                 refreshData()
+            }
+            .show()
+    }
+
+    private fun showCategorySelectDialog(file: File) {
+        val categories = arrayOf("Sticker", "GIF", "Meme", "Emoji")
+        val kinds = intArrayOf(
+            Contract.KIND_STICKER,
+            Contract.KIND_GIF,
+            Contract.KIND_MEME,
+            Contract.KIND_ANIMATED_EMOJI
+        )
+        MaterialAlertDialogBuilder(this)
+            .setTitle("Select Category")
+            .setItems(categories) { _, which ->
+                val newFile = LocalMediaManager.changeCategory(file, kinds[which])
+                if (newFile != null) {
+                    Toast.makeText(this, "Changed to ${categories[which]}", Toast.LENGTH_SHORT).show()
+                    refreshData()
+                } else {
+                    Toast.makeText(this, "Failed to change category", Toast.LENGTH_SHORT).show()
+                }
             }
             .show()
     }

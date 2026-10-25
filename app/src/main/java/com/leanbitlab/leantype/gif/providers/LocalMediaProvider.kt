@@ -34,7 +34,7 @@ class LocalMediaProvider(
         val tokens = if (q.isNotEmpty()) q.split("\\s+".toRegex()) else emptyList()
 
         val filtered = allItems.filter { item ->
-            val matchesKind = (kind == Contract.KIND_GIF || item.kind == kind)
+            val matchesKind = (item.kind == kind)
             val name = (item.attribution ?: "").lowercase()
             val matchesQuery = tokens.isEmpty() || tokens.all { name.contains(it) }
             matchesKind && matchesQuery
