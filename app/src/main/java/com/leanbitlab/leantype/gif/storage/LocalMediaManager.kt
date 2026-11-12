@@ -14,10 +14,39 @@ import java.io.File
 import java.io.FileInputStream
 import java.io.FileOutputStream
 import java.util.concurrent.ConcurrentHashMap
+import java.util.concurrent.atomic.AtomicLong
 import java.util.zip.ZipInputStream
 
 object LocalMediaManager {
+    private val SAFE_NAME_REGEX = Regex("[^a-zA-Z0-9_-]")
+    private val SUPPORTED_EXTENSIONS = setOf("gif", "webp", "png", "jpg", "jpeg")
+
     private val localThumbsMap = ConcurrentHashMap<String, File>()
+    private val importSeq = AtomicLong(0L)
+    private val cacheLock = Any()
+
+    @Volatile
+    private var cachedSnapshot: MediaSnapshot? = null
+    @Volatile
+    private var cacheDirty: Boolean = true
+
+    private data class MediaSnapshot(
+        val dirLastModified: Long,
+        val items: List<GifItem>,
+        val totalBytes: Long
+    )
+
+    private data class IndexedFile(
+        val file: File,
+        val lastModified: Long,
+        val length: Long
+    )
+
+    private fun nextStamp(): String = "${System.currentTimeMillis()}_${importSeq.incrementAndGet()}"
+
+    fun markDirty() {
+        cacheDirty = true
+    }
 
     fun getMediaDir(context: Context): File {
         return File(context.filesDir, "local_media").apply { mkdirs() }
@@ -31,11 +60,12 @@ object LocalMediaManager {
             localThumbsMap[name] = direct
             return direct
         }
+        // Populate all thumb mappings in one cached directory pass instead of linear regex scans per file
+        getItems(context)
+        localThumbsMap[name]?.let { if (it.exists()) return it }
+
         val candidate = dir.listFiles()?.firstOrNull { f ->
-            val cleanExt = f.extension.lowercase()
-            val safeBase = f.nameWithoutExtension.replace("[^a-zA-Z0-9_-]".toRegex(), "_")
-            val expected = "loc_${safeBase}_${f.name.hashCode()}.$cleanExt"
-            expected == name || "loc_${f.name}" == name
+            "loc_${f.name}" == name
         }
         if (candidate != null) {
             localThumbsMap[name] = candidate
@@ -43,40 +73,88 @@ object LocalMediaManager {
         return candidate
     }
 
-    fun getItems(context: Context, registry: ThumbRegistry? = null): List<GifItem> {
+    private fun getOrBuildSnapshot(context: Context): MediaSnapshot {
         val dir = getMediaDir(context)
-        val files = dir.listFiles { f ->
-            val ext = f.extension.lowercase()
-            ext in listOf("gif", "webp", "png", "jpg", "jpeg")
-        }?.sortedByDescending { it.lastModified() } ?: return emptyList()
-
-        return files.map { file ->
-            val cleanExt = file.extension.lowercase()
-            val safeBase = file.nameWithoutExtension.replace("[^a-zA-Z0-9_-]".toRegex(), "_")
-            val safeThumbName = "loc_${safeBase}_${file.name.hashCode()}.$cleanExt"
-            localThumbsMap[safeThumbName] = file
-            val kind = detectKind(file)
-            val cleanTitle = file.nameWithoutExtension
-                .removePrefix("meme_")
-                .removePrefix("emoji_")
-                .removePrefix("sticker_")
-                .removePrefix("gif_")
-                .replace('_', ' ')
-                .trim()
-                .ifEmpty { "Media" }
-
-            GifItem(
-                id = "loc_${file.name.hashCode()}",
-                provider = "local",
-                kind = kind,
-                previewUri = "content://${ThumbRegistry.AUTHORITY}/$safeThumbName",
-                width = 200,
-                height = 200,
-                isPack = false,
-                attribution = cleanTitle,
-                extra = file.absolutePath
-            )
+        val currentModified = dir.lastModified()
+        val existing = cachedSnapshot
+        if (existing != null && !cacheDirty && existing.dirLastModified == currentModified) {
+            return existing
         }
+
+        synchronized(cacheLock) {
+            val recheckModified = dir.lastModified()
+            val recheck = cachedSnapshot
+            if (recheck != null && !cacheDirty && recheck.dirLastModified == recheckModified) {
+                return recheck
+            }
+
+            val rawFiles = dir.listFiles()
+            if (rawFiles.isNullOrEmpty()) {
+                localThumbsMap.clear()
+                return MediaSnapshot(recheckModified, emptyList(), 0L).also {
+                    cachedSnapshot = it
+                    cacheDirty = false
+                }
+            }
+
+            val indexed = ArrayList<IndexedFile>(rawFiles.size)
+            var totalBytes = 0L
+            for (f in rawFiles) {
+                if (!f.isFile) continue
+                val fileName = f.name
+                if (fileName.startsWith("temp_")) continue
+                val len = f.length()
+                totalBytes += len
+                val ext = f.extension.lowercase()
+                if (ext in SUPPORTED_EXTENSIONS) {
+                    indexed.add(IndexedFile(f, f.lastModified(), len))
+                }
+            }
+
+            indexed.sortWith(compareByDescending<IndexedFile> { it.lastModified }.thenBy { it.file.name })
+
+            localThumbsMap.clear()
+            val items = ArrayList<GifItem>(indexed.size)
+            for (entry in indexed) {
+                val file = entry.file
+                val cleanExt = file.extension.lowercase()
+                val safeBase = file.nameWithoutExtension.replace(SAFE_NAME_REGEX, "_")
+                val safeThumbName = "loc_${safeBase}_${file.name.hashCode()}.$cleanExt"
+                localThumbsMap[safeThumbName] = file
+                val kind = detectKind(file)
+                val cleanTitle = file.nameWithoutExtension
+                    .removePrefix("meme_")
+                    .removePrefix("emoji_")
+                    .removePrefix("sticker_")
+                    .removePrefix("gif_")
+                    .replace('_', ' ')
+                    .trim()
+                    .ifEmpty { "Media" }
+
+                items.add(
+                    GifItem(
+                        id = "loc_${file.name.hashCode()}",
+                        provider = "local",
+                        kind = kind,
+                        previewUri = "content://${ThumbRegistry.AUTHORITY}/$safeThumbName",
+                        width = 200,
+                        height = 200,
+                        isPack = false,
+                        attribution = cleanTitle,
+                        extra = file.absolutePath
+                    )
+                )
+            }
+
+            return MediaSnapshot(dir.lastModified(), items, totalBytes).also {
+                cachedSnapshot = it
+                cacheDirty = false
+            }
+        }
+    }
+
+    fun getItems(context: Context, registry: ThumbRegistry? = null): List<GifItem> {
+        return getOrBuildSnapshot(context).items
     }
 
     fun detectKind(file: File): Int {
@@ -195,78 +273,84 @@ object LocalMediaManager {
         val dir = getMediaDir(context)
         var count = 0
         val contentResolver = context.contentResolver
-        for (uri in uris) {
-            runCatching {
-                val mime = contentResolver.getType(uri) ?: ""
-                val ext = when {
-                    mime.contains("gif") -> "gif"
-                    mime.contains("webp") -> "webp"
-                    mime.contains("png") -> "png"
-                    mime.contains("jpeg") || mime.contains("jpg") -> "jpg"
-                    else -> queryDisplayName(context, uri).substringAfterLast('.', "gif")
-                }.lowercase()
-                val rawName = queryDisplayName(context, uri).substringBeforeLast('.')
-                val safeBase = rawName.replace("[^a-zA-Z0-9_-]".toRegex(), "_").ifEmpty { "media" }
-                val kindPrefix = when (targetKind) {
-                    Contract.KIND_MEME -> "meme"
-                    Contract.KIND_ANIMATED_EMOJI -> "emoji"
-                    Contract.KIND_STICKER -> "sticker"
-                    Contract.KIND_GIF -> "gif"
-                    else -> when {
-                        rawName.contains("meme", ignoreCase = true) -> "meme"
-                        rawName.contains("emoji", ignoreCase = true) -> "emoji"
-                        ext == "gif" -> "gif"
-                        else -> "sticker"
+        try {
+            for (uri in uris) {
+                runCatching {
+                    val mime = contentResolver.getType(uri) ?: ""
+                    val displayName = queryDisplayName(context, uri)
+                    val ext = when {
+                        mime.contains("gif") -> "gif"
+                        mime.contains("webp") -> "webp"
+                        mime.contains("png") -> "png"
+                        mime.contains("jpeg") || mime.contains("jpg") -> "jpg"
+                        else -> displayName.substringAfterLast('.', "gif")
+                    }.lowercase()
+                    val rawName = displayName.substringBeforeLast('.')
+                    val safeBase = rawName.replace(SAFE_NAME_REGEX, "_").ifEmpty { "media" }
+                    val kindPrefix = when (targetKind) {
+                        Contract.KIND_MEME -> "meme"
+                        Contract.KIND_ANIMATED_EMOJI -> "emoji"
+                        Contract.KIND_STICKER -> "sticker"
+                        Contract.KIND_GIF -> "gif"
+                        else -> when {
+                            rawName.contains("meme", ignoreCase = true) -> "meme"
+                            rawName.contains("emoji", ignoreCase = true) -> "emoji"
+                            ext == "gif" -> "gif"
+                            else -> "sticker"
+                        }
                     }
-                }
 
-                val tempFile = File(dir, "temp_${System.currentTimeMillis()}.$ext")
-                contentResolver.openInputStream(uri)?.use { input ->
-                    FileOutputStream(tempFile).use { output ->
-                        input.copyTo(output)
+                    val tempFile = File(dir, "temp_${nextStamp()}.$ext")
+                    contentResolver.openInputStream(uri)?.use { input ->
+                        FileOutputStream(tempFile).use { output ->
+                            input.copyTo(output)
+                        }
                     }
-                }
-                if (!tempFile.exists() || tempFile.length() < 32) {
-                    tempFile.delete()
-                    return@runCatching
-                }
-
-                // If JPEG or PNG: convert to 512x512 WebP sticker format
-                val targetFile = if (ext in listOf("jpg", "jpeg", "png")) {
-                    val webpFile = File(dir, "${kindPrefix}_${safeBase}_${System.currentTimeMillis()}.webp")
-                    if (convertToWebpSticker(tempFile, webpFile)) {
+                    if (!tempFile.exists() || tempFile.length() < 32) {
                         tempFile.delete()
-                        webpFile
-                    } else {
-                        // Fallback to original
-                        val origFile = File(dir, "${kindPrefix}_${safeBase}_${System.currentTimeMillis()}.$ext")
-                        tempFile.renameTo(origFile)
-                        origFile
+                        return@runCatching
                     }
-                } else if (ext == "webp") {
-                    val webpFile = File(dir, "${kindPrefix}_${safeBase}_${System.currentTimeMillis()}.webp")
-                    if (isAnimatedWebp(tempFile)) {
-                        tempFile.renameTo(webpFile)
-                        webpFile
-                    } else {
-                        // Static WebP: scale down if > 512px
+
+                    val stamp = nextStamp()
+                    // If JPEG or PNG: convert to 512x512 WebP sticker format
+                    val targetFile = if (ext in listOf("jpg", "jpeg", "png")) {
+                        val webpFile = File(dir, "${kindPrefix}_${safeBase}_${stamp}.webp")
                         if (convertToWebpSticker(tempFile, webpFile)) {
                             tempFile.delete()
                             webpFile
                         } else {
+                            // Fallback to original
+                            val origFile = File(dir, "${kindPrefix}_${safeBase}_${stamp}.$ext")
+                            tempFile.renameTo(origFile)
+                            origFile
+                        }
+                    } else if (ext == "webp") {
+                        val webpFile = File(dir, "${kindPrefix}_${safeBase}_${stamp}.webp")
+                        if (isAnimatedWebp(tempFile)) {
                             tempFile.renameTo(webpFile)
                             webpFile
+                        } else {
+                            // Static WebP: scale down if > 512px
+                            if (convertToWebpSticker(tempFile, webpFile)) {
+                                tempFile.delete()
+                                webpFile
+                            } else {
+                                tempFile.renameTo(webpFile)
+                                webpFile
+                            }
                         }
+                    } else {
+                        // GIF or others
+                        val finalFile = File(dir, "${kindPrefix}_${safeBase}_${stamp}.$ext")
+                        tempFile.renameTo(finalFile)
+                        finalFile
                     }
-                } else {
-                    // GIF or others
-                    val finalFile = File(dir, "${kindPrefix}_${safeBase}_${System.currentTimeMillis()}.$ext")
-                    tempFile.renameTo(finalFile)
-                    finalFile
-                }
 
-                if (targetFile.exists() && targetFile.length() > 32) count++ else targetFile.delete()
+                    if (targetFile.exists() && targetFile.length() > 32) count++ else targetFile.delete()
+                }
             }
+        } finally {
+            if (count > 0) markDirty()
         }
         return count
     }
@@ -274,69 +358,73 @@ object LocalMediaManager {
     fun importZip(context: Context, zipUri: Uri): Int {
         val dir = getMediaDir(context)
         var count = 0
-        runCatching {
-            context.contentResolver.openInputStream(zipUri)?.use { input ->
-                ZipInputStream(input).use { zis ->
-                    var entry = zis.nextEntry
-                    while (entry != null) {
-                        val name = entry.name
-                        val ext = name.substringAfterLast('.', "").lowercase()
-                        if (!entry.isDirectory && ext in listOf("gif", "webp", "png", "jpg", "jpeg")) {
-                            val rawBase = name.substringAfterLast('/').substringBeforeLast('.')
-                            val safeBase = rawBase.replace("[^a-zA-Z0-9_-]".toRegex(), "_").ifEmpty { "pack" }
-                            val entryLower = name.lowercase()
-                            val kindPrefix = when {
-                                entryLower.contains("meme") -> "meme"
-                                entryLower.contains("emoji") -> "emoji"
-                                entryLower.contains("sticker") -> "sticker"
-                                entryLower.contains("gif") || ext == "gif" -> "gif"
-                                else -> "sticker"
-                            }
-                            val tempFile = File(dir, "temp_${System.currentTimeMillis()}.$ext")
-                            FileOutputStream(tempFile).use { fos ->
-                                zis.copyTo(fos)
-                            }
-                            if (tempFile.exists() && tempFile.length() > 32) {
-                                val targetFile = if (ext in listOf("jpg", "jpeg", "png")) {
-                                    val webpFile = File(dir, "${kindPrefix}_${safeBase}_${System.currentTimeMillis()}.webp")
-                                    if (convertToWebpSticker(tempFile, webpFile)) {
-                                        tempFile.delete()
-                                        webpFile
-                                    } else {
-                                        val origFile = File(dir, "${kindPrefix}_${safeBase}_${System.currentTimeMillis()}.$ext")
-                                        tempFile.renameTo(origFile)
-                                        origFile
-                                    }
-                                } else if (ext == "webp") {
-                                    val webpFile = File(dir, "${kindPrefix}_${safeBase}_${System.currentTimeMillis()}.webp")
-                                    if (isAnimatedWebp(tempFile)) {
-                                        tempFile.renameTo(webpFile)
-                                        webpFile
-                                    } else {
-                                        val webpFileConverted = File(dir, "${kindPrefix}_${safeBase}_${System.currentTimeMillis()}.webp")
-                                        if (convertToWebpSticker(tempFile, webpFileConverted)) {
+        try {
+            runCatching {
+                context.contentResolver.openInputStream(zipUri)?.use { input ->
+                    ZipInputStream(input).use { zis ->
+                        var entry = zis.nextEntry
+                        while (entry != null) {
+                            val name = entry.name
+                            val ext = name.substringAfterLast('.', "").lowercase()
+                            if (!entry.isDirectory && ext in SUPPORTED_EXTENSIONS) {
+                                val rawBase = name.substringAfterLast('/').substringBeforeLast('.')
+                                val safeBase = rawBase.replace(SAFE_NAME_REGEX, "_").ifEmpty { "pack" }
+                                val entryLower = name.lowercase()
+                                val kindPrefix = when {
+                                    entryLower.contains("meme") -> "meme"
+                                    entryLower.contains("emoji") -> "emoji"
+                                    entryLower.contains("sticker") -> "sticker"
+                                    entryLower.contains("gif") || ext == "gif" -> "gif"
+                                    else -> "sticker"
+                                }
+                                val tempFile = File(dir, "temp_${nextStamp()}.$ext")
+                                FileOutputStream(tempFile).use { fos ->
+                                    zis.copyTo(fos)
+                                }
+                                if (tempFile.exists() && tempFile.length() > 32) {
+                                    val stamp = nextStamp()
+                                    val targetFile = if (ext in listOf("jpg", "jpeg", "png")) {
+                                        val webpFile = File(dir, "${kindPrefix}_${safeBase}_${stamp}.webp")
+                                        if (convertToWebpSticker(tempFile, webpFile)) {
                                             tempFile.delete()
-                                            webpFileConverted
+                                            webpFile
                                         } else {
+                                            val origFile = File(dir, "${kindPrefix}_${safeBase}_${stamp}.$ext")
+                                            tempFile.renameTo(origFile)
+                                            origFile
+                                        }
+                                    } else if (ext == "webp") {
+                                        val webpFile = File(dir, "${kindPrefix}_${safeBase}_${stamp}.webp")
+                                        if (isAnimatedWebp(tempFile)) {
                                             tempFile.renameTo(webpFile)
                                             webpFile
+                                        } else {
+                                            if (convertToWebpSticker(tempFile, webpFile)) {
+                                                tempFile.delete()
+                                                webpFile
+                                            } else {
+                                                tempFile.renameTo(webpFile)
+                                                webpFile
+                                            }
                                         }
+                                    } else {
+                                        val finalFile = File(dir, "${kindPrefix}_${safeBase}_${stamp}.$ext")
+                                        tempFile.renameTo(finalFile)
+                                        finalFile
                                     }
+                                    if (targetFile.exists() && targetFile.length() > 32) count++ else targetFile.delete()
                                 } else {
-                                    val finalFile = File(dir, "${kindPrefix}_${safeBase}_${System.currentTimeMillis()}.$ext")
-                                    tempFile.renameTo(finalFile)
-                                    finalFile
+                                    tempFile.delete()
                                 }
-                                if (targetFile.exists() && targetFile.length() > 32) count++ else targetFile.delete()
-                            } else {
-                                tempFile.delete()
                             }
+                            zis.closeEntry()
+                            entry = zis.nextEntry
                         }
-                        zis.closeEntry()
-                        entry = zis.nextEntry
                     }
                 }
             }
+        } finally {
+            if (count > 0) markDirty()
         }
         return count
     }
@@ -358,6 +446,7 @@ object LocalMediaManager {
         val success = file.renameTo(newFile)
         if (success) {
             localThumbsMap.values.remove(file)
+            markDirty()
             return newFile
         }
         return null
@@ -367,17 +456,19 @@ object LocalMediaManager {
         localThumbsMap.clear()
         return getMediaDir(context).deleteRecursively().also {
             getMediaDir(context).mkdirs()
+            markDirty()
         }
     }
 
     fun deleteFile(file: File): Boolean {
         localThumbsMap.values.remove(file)
-        return runCatching { file.delete() }.getOrDefault(false)
+        return runCatching { file.delete() }.getOrDefault(false).also { deleted ->
+            if (deleted) markDirty()
+        }
     }
 
     fun getTotalBytes(context: Context): Long {
-        val files = getMediaDir(context).listFiles() ?: return 0L
-        return files.sumOf { if (it.isFile) it.length() else 0L }
+        return getOrBuildSnapshot(context).totalBytes
     }
 
     fun queryDisplayName(context: Context, uri: Uri): String {

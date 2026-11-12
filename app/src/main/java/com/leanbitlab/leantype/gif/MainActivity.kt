@@ -1,5 +1,6 @@
 package com.leanbitlab.leantype.gif
 
+import android.content.Context
 import android.content.Intent
 import android.content.res.Configuration
 import android.graphics.Color
@@ -16,10 +17,17 @@ import android.widget.Toast
 import androidx.activity.result.contract.ActivityResultContracts
 import androidx.appcompat.app.AppCompatActivity
 import androidx.core.view.WindowCompat
+import androidx.recyclerview.widget.ConcatAdapter
+import androidx.recyclerview.widget.DiffUtil
 import androidx.recyclerview.widget.GridLayoutManager
+import androidx.recyclerview.widget.ListAdapter
 import androidx.recyclerview.widget.RecyclerView
+import coil.ImageLoader
+import coil.disk.DiskCache
+import coil.dispose
 import coil.load
-import coil.request.CachePolicy
+import coil.memory.MemoryCache
+import coil.size.Precision
 import com.google.android.material.appbar.MaterialToolbar
 import com.google.android.material.button.MaterialButton
 import com.google.android.material.color.DynamicColors
@@ -29,26 +37,22 @@ import com.leanbitlab.leantype.gif.storage.LocalMediaManager
 import com.leanbitlab.leantype.gif.storage.ThumbRegistry
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.Job
+import kotlinx.coroutines.SupervisorJob
+import kotlinx.coroutines.cancel
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
 import java.io.File
 
 class MainActivity : AppCompatActivity() {
 
-    private val scope = CoroutineScope(Dispatchers.Main)
+    private val scope = CoroutineScope(SupervisorJob() + Dispatchers.Main)
+    private var refreshJob: Job? = null
 
     private lateinit var toolbar: MaterialToolbar
-    private lateinit var tvStatsSummary: TextView
-    private lateinit var tvGalleryTitle: TextView
-    private lateinit var btnImportFiles: View
-    private lateinit var btnImportZip: View
-    private lateinit var btnClearAll: MaterialButton
-    private lateinit var layoutEmptyState: View
     private lateinit var recyclerViewMedia: RecyclerView
-
-    private val mediaAdapter = LocalMediaAdapter(
-        onItemClick = { item, file -> showItemDetailsDialog(item, file) }
-    )
+    private lateinit var headerAdapter: HeaderAdapter
+    private lateinit var mediaAdapter: LocalMediaAdapter
 
     private var pendingImportKind: Int? = null
 
@@ -92,35 +96,42 @@ class MainActivity : AppCompatActivity() {
         }
 
         toolbar = findViewById(R.id.toolbar)
-        tvStatsSummary = findViewById(R.id.tvStatsSummary)
-        tvGalleryTitle = findViewById(R.id.tvGalleryTitle)
-        btnImportFiles = findViewById(R.id.btnImportFiles)
-        btnImportZip = findViewById(R.id.btnImportZip)
-        btnClearAll = findViewById(R.id.btnClearAll)
-        layoutEmptyState = findViewById(R.id.layoutEmptyState)
         recyclerViewMedia = findViewById(R.id.recyclerViewMedia)
 
         toolbar.setNavigationOnClickListener {
             finish()
         }
 
-        btnImportFiles.setOnClickListener {
-            showImportCategoryDialog()
+        headerAdapter = HeaderAdapter(
+            onImportFilesClick = { showImportCategoryDialog() },
+            onImportZipClick = {
+                pickZipLauncher.launch(arrayOf("application/zip", "application/x-zip-compressed", "*/*"))
+            },
+            onClearAllClick = { showClearAllDialog() }
+        )
+
+        mediaAdapter = LocalMediaAdapter(
+            thumbLoader = getThumbLoader(applicationContext),
+            onItemClick = { item, file -> showItemDetailsDialog(item, file) }
+        )
+
+        val gridLayoutManager = GridLayoutManager(this, 3).apply {
+            spanSizeLookup = object : GridLayoutManager.SpanSizeLookup() {
+                override fun getSpanSize(position: Int): Int = if (position == 0) 3 else 1
+            }
         }
+        recyclerViewMedia.layoutManager = gridLayoutManager
+        recyclerViewMedia.setItemViewCacheSize(18)
+        recyclerViewMedia.adapter = ConcatAdapter(headerAdapter, mediaAdapter)
 
-        btnImportZip.setOnClickListener {
-            pickZipLauncher.launch(arrayOf("application/zip", "application/x-zip-compressed", "*/*"))
+        if (savedInstanceState == null) {
+            handleSendIntent(intent)
         }
+    }
 
-        btnClearAll.setOnClickListener {
-            showClearAllDialog()
-        }
-
-        recyclerViewMedia.layoutManager = GridLayoutManager(this, 3)
-        recyclerViewMedia.adapter = mediaAdapter
-
-        refreshData()
-        handleSendIntent(intent)
+    override fun onDestroy() {
+        scope.cancel()
+        super.onDestroy()
     }
 
     override fun onNewIntent(intent: Intent) {
@@ -165,6 +176,9 @@ class MainActivity : AppCompatActivity() {
             }
         }
 
+        // Prevent re-importing the same share intent on configuration changes
+        intent.action = null
+
         if (uris.isEmpty()) return
 
         scope.launch {
@@ -207,34 +221,16 @@ class MainActivity : AppCompatActivity() {
     }
 
     private fun refreshData() {
-        scope.launch {
-            val registry = ThumbRegistry(applicationContext)
-            val items = withContext(Dispatchers.IO) {
-                try {
-                    File(cacheDir, "image_cache").deleteRecursively()
-                    registry.trimIfNeeded()
-                } catch (_: Exception) {}
-                LocalMediaManager.getItems(applicationContext, registry)
-            }
-            val totalBytes = withContext(Dispatchers.IO) {
-                LocalMediaManager.getTotalBytes(applicationContext)
+        refreshJob?.cancel()
+        refreshJob = scope.launch {
+            val (items, totalBytes) = withContext(Dispatchers.IO) {
+                val registry = ThumbRegistry(applicationContext)
+                val loaded = LocalMediaManager.getItems(applicationContext, registry)
+                val bytes = LocalMediaManager.getTotalBytes(applicationContext)
+                loaded to bytes
             }
 
-            val formattedSize = Formatter.formatFileSize(applicationContext, totalBytes)
-            if (items.isEmpty()) {
-                tvStatsSummary.text = "No offline media imported"
-                tvGalleryTitle.text = "Imported Media (0)"
-                btnClearAll.visibility = View.GONE
-                layoutEmptyState.visibility = View.VISIBLE
-                recyclerViewMedia.visibility = View.GONE
-            } else {
-                tvStatsSummary.text = "${items.size} offline items - $formattedSize"
-                tvGalleryTitle.text = "Imported Media (${items.size})"
-                btnClearAll.visibility = View.VISIBLE
-                layoutEmptyState.visibility = View.GONE
-                recyclerViewMedia.visibility = View.VISIBLE
-            }
-
+            headerAdapter.updateStats(items.size, totalBytes)
             mediaAdapter.submitList(items)
         }
     }
@@ -244,9 +240,15 @@ class MainActivity : AppCompatActivity() {
             .setTitle("Clear Local Media")
             .setMessage("Delete all imported offline GIFs and stickers? They will no longer appear in the keyboard.")
             .setPositiveButton("Clear All") { _, _ ->
-                LocalMediaManager.clearAll(applicationContext)
-                Toast.makeText(this, "Local media cleared", Toast.LENGTH_SHORT).show()
-                refreshData()
+                scope.launch {
+                    withContext(Dispatchers.IO) {
+                        LocalMediaManager.clearAll(applicationContext)
+                        getThumbLoader(applicationContext).diskCache?.clear()
+                        getThumbLoader(applicationContext).memoryCache?.clear()
+                    }
+                    Toast.makeText(this@MainActivity, "Local media cleared", Toast.LENGTH_SHORT).show()
+                    refreshData()
+                }
             }
             .setNegativeButton("Cancel", null)
             .show()
@@ -281,9 +283,13 @@ class MainActivity : AppCompatActivity() {
                 showCategorySelectDialog(file)
             }
             .setNegativeButton("Delete") { _, _ ->
-                LocalMediaManager.deleteFile(file)
-                Toast.makeText(this, "Item deleted", Toast.LENGTH_SHORT).show()
-                refreshData()
+                scope.launch {
+                    withContext(Dispatchers.IO) {
+                        LocalMediaManager.deleteFile(file)
+                    }
+                    Toast.makeText(this@MainActivity, "Item deleted", Toast.LENGTH_SHORT).show()
+                    refreshData()
+                }
             }
             .show()
     }
@@ -299,28 +305,98 @@ class MainActivity : AppCompatActivity() {
         MaterialAlertDialogBuilder(this)
             .setTitle("Select Category")
             .setItems(categories) { _, which ->
-                val newFile = LocalMediaManager.changeCategory(file, kinds[which])
-                if (newFile != null) {
-                    Toast.makeText(this, "Changed to ${categories[which]}", Toast.LENGTH_SHORT).show()
-                    refreshData()
-                } else {
-                    Toast.makeText(this, "Failed to change category", Toast.LENGTH_SHORT).show()
+                scope.launch {
+                    val newFile = withContext(Dispatchers.IO) {
+                        LocalMediaManager.changeCategory(file, kinds[which])
+                    }
+                    if (newFile != null) {
+                        Toast.makeText(this@MainActivity, "Changed to ${categories[which]}", Toast.LENGTH_SHORT).show()
+                        refreshData()
+                    } else {
+                        Toast.makeText(this@MainActivity, "Failed to change category", Toast.LENGTH_SHORT).show()
+                    }
                 }
             }
             .show()
     }
 
-    class LocalMediaAdapter(
-        private val onItemClick: (GifItem, File) -> Unit
-    ) : RecyclerView.Adapter<LocalMediaAdapter.MediaViewHolder>() {
+    private class HeaderAdapter(
+        private val onImportFilesClick: () -> Unit,
+        private val onImportZipClick: () -> Unit,
+        private val onClearAllClick: () -> Unit
+    ) : RecyclerView.Adapter<HeaderAdapter.HeaderViewHolder>() {
 
-        private val items = mutableListOf<GifItem>()
+        private var itemCountValue: Int = 0
+        private var totalBytesValue: Long = 0L
+        private var boundHolder: HeaderViewHolder? = null
 
-        fun submitList(newItems: List<GifItem>) {
-            items.clear()
-            items.addAll(newItems)
-            notifyDataSetChanged()
+        fun updateStats(count: Int, totalBytes: Long) {
+            itemCountValue = count
+            totalBytesValue = totalBytes
+            boundHolder?.bind(count, totalBytes)
         }
+
+        override fun onCreateViewHolder(parent: ViewGroup, viewType: Int): HeaderViewHolder {
+            val view = LayoutInflater.from(parent.context).inflate(R.layout.item_gallery_header, parent, false)
+            return HeaderViewHolder(view)
+        }
+
+        override fun onBindViewHolder(holder: HeaderViewHolder, position: Int) {
+            boundHolder = holder
+            holder.bind(itemCountValue, totalBytesValue)
+        }
+
+        override fun onViewRecycled(holder: HeaderViewHolder) {
+            super.onViewRecycled(holder)
+            if (boundHolder === holder) boundHolder = null
+        }
+
+        override fun getItemCount(): Int = 1
+
+        inner class HeaderViewHolder(itemView: View) : RecyclerView.ViewHolder(itemView) {
+            private val tvStatsSummary: TextView = itemView.findViewById(R.id.tvStatsSummary)
+            private val tvGalleryTitle: TextView = itemView.findViewById(R.id.tvGalleryTitle)
+            private val btnImportFiles: View = itemView.findViewById(R.id.btnImportFiles)
+            private val btnImportZip: View = itemView.findViewById(R.id.btnImportZip)
+            private val btnClearAll: MaterialButton = itemView.findViewById(R.id.btnClearAll)
+            private val layoutEmptyState: View = itemView.findViewById(R.id.layoutEmptyState)
+
+            init {
+                btnImportFiles.setOnClickListener { onImportFilesClick() }
+                btnImportZip.setOnClickListener { onImportZipClick() }
+                btnClearAll.setOnClickListener { onClearAllClick() }
+            }
+
+            fun bind(count: Int, totalBytes: Long) {
+                val ctx = itemView.context.applicationContext
+                val formattedSize = Formatter.formatFileSize(ctx, totalBytes)
+                if (count == 0) {
+                    tvStatsSummary.text = "No offline media imported"
+                    tvGalleryTitle.text = "Imported Media (0)"
+                    btnClearAll.visibility = View.GONE
+                    layoutEmptyState.visibility = View.VISIBLE
+                } else {
+                    tvStatsSummary.text = "$count offline items - $formattedSize"
+                    tvGalleryTitle.text = "Imported Media ($count)"
+                    btnClearAll.visibility = View.VISIBLE
+                    layoutEmptyState.visibility = View.GONE
+                }
+            }
+        }
+    }
+
+    private class DiffCallback : DiffUtil.ItemCallback<GifItem>() {
+        override fun areItemsTheSame(oldItem: GifItem, newItem: GifItem): Boolean =
+            oldItem.extra == newItem.extra && oldItem.id == newItem.id
+
+        override fun areContentsTheSame(oldItem: GifItem, newItem: GifItem): Boolean =
+            oldItem == newItem
+    }
+
+    class LocalMediaAdapter(
+        private val thumbLoader: ImageLoader,
+        private val onItemClick: (GifItem, File) -> Unit
+    ) : ListAdapter<GifItem, LocalMediaAdapter.MediaViewHolder>(DiffCallback()) {
 
         override fun onCreateViewHolder(parent: ViewGroup, viewType: Int): MediaViewHolder {
             val view = LayoutInflater.from(parent.context).inflate(R.layout.item_local_media, parent, false)
@@ -328,10 +404,13 @@ class MainActivity : AppCompatActivity() {
         }
 
         override fun onBindViewHolder(holder: MediaViewHolder, position: Int) {
-            holder.bind(items[position])
+            holder.bind(getItem(position))
         }
 
-        override fun getItemCount(): Int = items.size
+        override fun onViewRecycled(holder: MediaViewHolder) {
+            super.onViewRecycled(holder)
+            holder.unbind()
+        }
 
         inner class MediaViewHolder(itemView: View) : RecyclerView.ViewHolder(itemView) {
             private val ivThumbnail: ImageView = itemView.findViewById(R.id.ivThumbnail)
@@ -339,9 +418,9 @@ class MainActivity : AppCompatActivity() {
 
             fun bind(item: GifItem) {
                 val file = File(item.extra)
-                ivThumbnail.load(file) {
-                    crossfade(true)
-                    diskCachePolicy(CachePolicy.DISABLED)
+                ivThumbnail.load(file, thumbLoader) {
+                    size(256, 256)
+                    precision(Precision.INEXACT)
                 }
 
                 tvKindBadge.text = when (item.kind) {
@@ -355,6 +434,35 @@ class MainActivity : AppCompatActivity() {
                     onItemClick(item, file)
                 }
             }
+
+            fun unbind() {
+                ivThumbnail.dispose()
+                ivThumbnail.setImageDrawable(null)
+            }
+        }
+    }
+
+    companion object {
+        @Volatile
+        private var sharedThumbLoader: ImageLoader? = null
+
+        private fun getThumbLoader(context: Context): ImageLoader = sharedThumbLoader ?: synchronized(this) {
+            val appContext = context.applicationContext
+            sharedThumbLoader ?: ImageLoader.Builder(appContext)
+                .memoryCache {
+                    MemoryCache.Builder(appContext)
+                        .maxSizePercent(0.20)
+                        .build()
+                }
+                .diskCache {
+                    DiskCache.Builder()
+                        .directory(File(appContext.cacheDir, "thumb_disk_cache"))
+                        .maxSizeBytes(40L * 1024 * 1024)
+                        .build()
+                }
+                .crossfade(false)
+                .build()
+                .also { sharedThumbLoader = it }
         }
     }
 }

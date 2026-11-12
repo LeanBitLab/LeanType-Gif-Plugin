@@ -3,10 +3,15 @@ package com.leanbitlab.leantype.gif.security
 import android.content.Context
 import android.os.Binder
 import android.os.Process
+import android.os.SystemClock
 import com.leanbitlab.leantype.gif.BuildConfig
 import com.leanbitlab.leantype.gif.SigningCerts
+import java.util.concurrent.ConcurrentHashMap
 
 object CallerCheck {
+    private const val UID_CACHE_TTL_MS = 5_000L
+    private val verifiedUids = ConcurrentHashMap<Int, Long>()
+
     private val ALLOWED_PACKAGES = setOf(
         "com.leanbitlab.leantype",
         "com.leanbitlab.leantype.offline",
@@ -25,16 +30,24 @@ object CallerCheck {
         if (uid == Process.myUid()) {
             return
         }
+        val now = SystemClock.elapsedRealtime()
+        val cachedUntil = verifiedUids[uid]
+        if (cachedUntil != null && now < cachedUntil) {
+            return
+        }
+
         val pm = context.packageManager
         val packages = pm.getPackagesForUid(uid) ?: throw SecurityException("Caller UID has no packages")
-        
+
         val allowedHost = packages.firstOrNull { it in ALLOWED_PACKAGES }
             ?: throw SecurityException("Caller package '${packages.joinToString()}' is not an authorized LeanType host")
 
         val certs = SigningCerts.sha256Digests(pm, allowedHost)
         val valid = certs.any { it in PINNED_CERTS } || (BuildConfig.DEBUG && certs.any { it in SigningCerts.sha256Digests(pm, context.packageName) })
         if (!valid) {
+            verifiedUids.remove(uid)
             throw SecurityException("Caller certificate is not trusted for '$allowedHost'")
         }
+        verifiedUids[uid] = now + UID_CACHE_TTL_MS
     }
 }
