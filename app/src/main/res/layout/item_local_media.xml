@@ -22,6 +22,16 @@
             android:scaleType="centerCrop"
             android:contentDescription="Media Thumbnail" />
 
+        <ImageView
+            android:id="@+id/ivSelected"
+            android:layout_width="24dp"
+            android:layout_height="24dp"
+            android:layout_gravity="top|end"
+            android:layout_margin="6dp"
+            android:src="@drawable/ic_check_circle"
+            android:contentDescription="Selected"
+            android:visibility="gone" />
+
         <TextView
             android:id="@+id/tvKindBadge"
             android:layout_width="wrap_content"

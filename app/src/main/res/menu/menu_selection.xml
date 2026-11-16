@@ -1,0 +1,24 @@
+<?xml version="1.0" encoding="utf-8"?>
+<menu xmlns:android="http://schemas.android.com/apk/res/android"
+    xmlns:app="http://schemas.android.com/apk/res-auto">
+    <item
+        android:id="@+id/action_select_all"
+        android:title="Select all"
+        app:showAsAction="never" />
+    <item
+        android:id="@+id/action_move_pack"
+        android:title="Move to pack"
+        app:showAsAction="never" />
+    <item
+        android:id="@+id/action_change_category"
+        android:title="Change category"
+        app:showAsAction="never" />
+    <item
+        android:id="@+id/action_rename"
+        android:title="Rename"
+        app:showAsAction="never" />
+    <item
+        android:id="@+id/action_delete"
+        android:title="Delete"
+        app:showAsAction="never" />
+</menu>
