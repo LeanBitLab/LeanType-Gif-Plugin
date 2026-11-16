@@ -6,6 +6,7 @@ import com.leanbitlab.leantype.gif.GifItem
 import com.leanbitlab.leantype.gif.ProviderInfo
 import com.leanbitlab.leantype.gif.storage.LocalMediaManager
 import com.leanbitlab.leantype.gif.storage.ThumbRegistry
+import java.io.File
 
 class LocalMediaProvider(
     private val context: Context,
@@ -51,6 +52,8 @@ class LocalMediaProvider(
     }
 
     override suspend fun resolveFullMediaUrl(item: GifItem): String? {
-        return item.extra
+        val path = item.extra ?: return null
+        // an item from the keyboard's Recent list may point at a file that was renamed or moved since
+        return LocalMediaManager.resolveMovedFile(context, File(path))?.absolutePath ?: path
     }
 }
