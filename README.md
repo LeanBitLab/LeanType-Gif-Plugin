@@ -23,6 +23,7 @@ This plugin provides fast, out-of-process media search and retrieval (GIFs, Stic
 - **🎬 Multi-Category Rich Media**: Search and browse across GIFs, Stickers, Memes, and Animated Emojis.
 - **🕒 Universal Recent Tab**: Quick access to your recently sent GIFs and stickers across all providers.
 - **📁 100% Offline Local Media**: Import and browse your own GIF, WebP, PNG files, and ZIP sticker packs with zero internet required.
+- **🗂️ Categories & Packs**: Organize imported media inside the plugin. Open a category to see its full grid, group files into named packs, select several files to set a pack, rename titles or move them to another category, without zipping anything first.
 - **🔄 Multi-Provider Support**: Seamless support for **GIPHY**, **KLIPY**, and **Local Media**, with 1-tap provider switching directly from the search bar badge.
 - **🛡️ Secure API Key Vault**: Your personal API keys are encrypted at rest with hardware-backed Android Keystore keys and never shared outside the plugin process.
 - **⚡ Zero-Memory Overhead**: Files are streamed directly to target apps using Android commitContent APIs and read-only file descriptors, keeping keyboard input responsive and smooth.
