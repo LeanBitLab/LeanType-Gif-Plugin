@@ -20,6 +20,18 @@ import java.util.zip.ZipInputStream
 object LocalMediaManager {
     private val SAFE_NAME_REGEX = Regex("[^a-zA-Z0-9_-]")
     private val SUPPORTED_EXTENSIONS = setOf("gif", "webp", "png", "jpg", "jpeg")
+    private val KIND_PREFIXES = listOf("meme_", "emoji_", "sticker_", "gif_")
+    private const val MAX_PACK_LENGTH = 40
+    private const val MAX_TITLE_LENGTH = 60
+    private const val ALIAS_FILE_NAME = "local_media_aliases.txt"
+    private const val MAX_ALIAS_HOPS = 8
+    private val aliasLock = Any()
+
+    /** "_<millis>_<seq>" appended to every stored name by nextStamp() */
+    private val STAMP_REGEX = Regex("_\\d+_\\d+$")
+
+    /** Separates the pack name from the file name in a stored file, SAFE_NAME_REGEX never produces it. */
+    private const val PACK_DELIMITER = '@'
 
     private val localThumbsMap = ConcurrentHashMap<String, File>()
     private val importSeq = AtomicLong(0L)
@@ -69,8 +81,10 @@ object LocalMediaManager {
         }
         if (candidate != null) {
             localThumbsMap[name] = candidate
+            return candidate
         }
-        return candidate
+        // a thumbnail name remembered before the file was renamed
+        return resolveMovedThumb(context, name)
     }
 
     private fun getOrBuildSnapshot(context: Context): MediaSnapshot {
@@ -117,9 +131,7 @@ object LocalMediaManager {
             val items = ArrayList<GifItem>(indexed.size)
             for (entry in indexed) {
                 val file = entry.file
-                val cleanExt = file.extension.lowercase()
-                val safeBase = file.nameWithoutExtension.replace(SAFE_NAME_REGEX, "_")
-                val safeThumbName = "loc_${safeBase}_${file.name.hashCode()}.$cleanExt"
+                val safeThumbName = thumbNameFor(file)
                 localThumbsMap[safeThumbName] = file
                 val kind = detectKind(file)
                 val cleanTitle = file.nameWithoutExtension
@@ -127,6 +139,8 @@ object LocalMediaManager {
                     .removePrefix("emoji_")
                     .removePrefix("sticker_")
                     .removePrefix("gif_")
+                    .replace(STAMP_REGEX, "")
+                    .replace(PACK_DELIMITER, ' ')
                     .replace('_', ' ')
                     .trim()
                     .ifEmpty { "Media" }
@@ -157,14 +171,205 @@ object LocalMediaManager {
         return getOrBuildSnapshot(context).items
     }
 
+    private fun thumbNameFor(file: File): String {
+        val safeBase = file.nameWithoutExtension.replace(SAFE_NAME_REGEX, "_")
+        return "loc_${safeBase}_${file.name.hashCode()}.${file.extension.lowercase()}"
+    }
+
+    /*
+     * Old name -> new name for files that were moved, renamed or recategorized. The keyboard keeps a snapshot of recently
+     * used items (file path and thumbnail name), and older keyboard versions cannot be told about the change, so lookups
+     * that miss fall back to this map. Stored next to the media folder, one "F|T <old> <new>" line per entry.
+     */
+    private class Aliases(val files: MutableMap<String, String> = HashMap(), val thumbs: MutableMap<String, String> = HashMap())
+
+    private fun aliasFile(mediaDir: File) = File(mediaDir.parentFile, ALIAS_FILE_NAME)
+
+    private fun readAliases(mediaDir: File): Aliases {
+        val aliases = Aliases()
+        val file = aliasFile(mediaDir)
+        if (!file.exists()) return aliases
+        runCatching {
+            file.forEachLine { line ->
+                val parts = line.split('\t')
+                if (parts.size != 3) return@forEachLine
+                when (parts[0]) {
+                    "F" -> aliases.files[parts[1]] = parts[2]
+                    "T" -> aliases.thumbs[parts[1]] = parts[2]
+                }
+            }
+        }
+        return aliases
+    }
+
+    private fun writeAliases(mediaDir: File, aliases: Aliases) {
+        val file = aliasFile(mediaDir)
+        if (aliases.files.isEmpty() && aliases.thumbs.isEmpty()) {
+            file.delete()
+            return
+        }
+        val text = buildString {
+            for ((old, new) in aliases.files) append("F\t$old\t$new\n")
+            for ((old, new) in aliases.thumbs) append("T\t$old\t$new\n")
+        }
+        val tmp = File(file.parentFile, "$ALIAS_FILE_NAME.tmp")
+        runCatching {
+            tmp.writeText(text)
+            if (!tmp.renameTo(file)) tmp.delete()
+        }
+    }
+
+    private fun recordMove(oldFile: File, newFile: File) {
+        val dir = newFile.parentFile ?: return
+        synchronized(aliasLock) {
+            val aliases = readAliases(dir)
+            val oldName = oldFile.name
+            val newName = newFile.name
+            // entries that pointed at the old name now point at the new one, so a lookup is always a single hop
+            for (map in listOf(aliases.files, aliases.thumbs)) {
+                for (entry in map.entries) if (entry.value == oldName) entry.setValue(newName)
+            }
+            aliases.files[oldName] = newName
+            aliases.thumbs[thumbNameFor(oldFile)] = newName
+            // renaming back to an earlier name must not leave an entry that points at itself
+            aliases.files.remove(newName)
+            aliases.thumbs.remove(thumbNameFor(newFile))
+            writeAliases(dir, aliases)
+        }
+    }
+
+    private fun forgetAliasesTo(file: File) {
+        val dir = file.parentFile ?: return
+        synchronized(aliasLock) {
+            if (!aliasFile(dir).exists()) return
+            val aliases = readAliases(dir)
+            val before = aliases.files.size + aliases.thumbs.size
+            aliases.files.values.removeAll { it == file.name }
+            aliases.thumbs.values.removeAll { it == file.name }
+            if (aliases.files.size + aliases.thumbs.size != before) writeAliases(dir, aliases)
+        }
+    }
+
+    private fun followAlias(dir: File, aliases: Aliases, startName: String): File? {
+        var name = startName
+        repeat(MAX_ALIAS_HOPS) {
+            val next = aliases.files[name] ?: return null
+            val candidate = File(dir, next)
+            if (candidate.exists()) return candidate
+            name = next
+        }
+        return null
+    }
+
+    /** The current file for a path that was valid before the file was moved or renamed, null if there is none. */
+    fun resolveMovedFile(context: Context, file: File): File? {
+        if (file.exists()) return file
+        val dir = getMediaDir(context)
+        if (file.parentFile != dir) return null
+        synchronized(aliasLock) { return followAlias(dir, readAliases(dir), file.name) }
+    }
+
+    private fun resolveMovedThumb(context: Context, thumbName: String): File? {
+        val dir = getMediaDir(context)
+        synchronized(aliasLock) {
+            val aliases = readAliases(dir)
+            val target = aliases.thumbs[thumbName] ?: return null
+            val candidate = File(dir, target)
+            return if (candidate.exists()) candidate else followAlias(dir, aliases, target)
+        }
+    }
+
+    private class StoredName(val packRaw: String?, val title: String, val stamp: String?)
+
+    private fun parseStoredName(file: File): StoredName {
+        val base = file.nameWithoutExtension
+        var rest = KIND_PREFIXES.firstOrNull { base.startsWith(it) }?.let { base.removePrefix(it) } ?: base
+        val end = rest.indexOf(PACK_DELIMITER)
+        var packRaw: String? = null
+        if (end >= 0) {
+            packRaw = rest.substring(0, end).ifEmpty { null }
+            rest = rest.substring(end + 1)
+        }
+        val stamp = STAMP_REGEX.find(rest)?.value
+        return StoredName(packRaw, if (stamp != null) rest.removeSuffix(stamp) else rest, stamp)
+    }
+
+    private fun kindPrefix(kind: Int): String = when (kind) {
+        Contract.KIND_MEME -> "meme"
+        Contract.KIND_ANIMATED_EMOJI -> "emoji"
+        Contract.KIND_STICKER -> "sticker"
+        else -> "gif"
+    }
+
+    /** Title shown for a stored file: no kind prefix, pack or stamp, underscores as spaces. */
+    fun getTitle(file: File): String = parseStoredName(file).title.replace('_', ' ').trim()
+
+    private fun renameStored(file: File, packPart: String, title: String): File? {
+        if (!file.exists()) return null
+        val parsed = parseStoredName(file)
+        val ext = file.extension.lowercase()
+        val stamp = parsed.stamp ?: "_${nextStamp()}"
+        val newFile = File(file.parentFile, "${kindPrefix(detectKind(file))}_${packPart}${title}${stamp}.$ext")
+        if (newFile == file) return file
+        if (newFile.exists() || !file.renameTo(newFile)) return null
+        localThumbsMap.values.remove(file)
+        recordMove(file, newFile)
+        markDirty()
+        return newFile
+    }
+
+    /** Moves a file into the given pack, or out of any pack when [packName] is blank. */
+    fun setPack(file: File, packName: String?): File? =
+        renameStored(file, packFileNamePart(packName), parseStoredName(file).title)
+
+    /** Changes the title, keeping kind, pack and the unique stamp. Null when the new title is unusable. */
+    fun renameTitle(file: File, newTitle: String): File? {
+        val safe = newTitle
+            .replace(SAFE_NAME_REGEX, "_")
+            .replace(Regex("_+"), "_")
+            .trim('_', '-')
+            .take(MAX_TITLE_LENGTH)
+        if (safe.isEmpty()) return null
+        val packRaw = parseStoredName(file).packRaw
+        return renameStored(file, if (packRaw == null) "" else "$packRaw$PACK_DELIMITER", safe)
+    }
+
+    /** Pack name stored in the file name, or null. Shown with spaces instead of underscores. */
+    fun getPackName(file: File): String? {
+        val base = file.nameWithoutExtension
+        val rest = KIND_PREFIXES.firstOrNull { base.startsWith(it) }?.let { base.removePrefix(it) } ?: base
+        val end = rest.indexOf(PACK_DELIMITER)
+        if (end <= 0) return null
+        return rest.substring(0, end).replace('_', ' ').trim().ifEmpty { null }
+    }
+
+    /** File name part for an imported pack, "" when there is no usable pack name. */
+    private fun packFileNamePart(packName: String?): String {
+        val safe = packName.orEmpty()
+            .replace(SAFE_NAME_REGEX, "_")
+            .replace(Regex("_+"), "_")
+            .trim('_', '-')
+            .take(MAX_PACK_LENGTH)
+        return if (safe.isEmpty()) "" else "$safe$PACK_DELIMITER"
+    }
+
     fun detectKind(file: File): Int {
         val name = file.name.lowercase()
         val ext = file.extension.lowercase()
+        // the stored prefix wins, so a pack called "Memes" cannot change the kind of its stickers
+        KIND_PREFIXES.firstOrNull { name.startsWith(it) }?.let {
+            return when (it) {
+                "meme_" -> Contract.KIND_MEME
+                "emoji_" -> Contract.KIND_ANIMATED_EMOJI
+                "sticker_" -> Contract.KIND_STICKER
+                else -> Contract.KIND_GIF
+            }
+        }
         return when {
-            name.startsWith("meme_") || name.contains("meme") -> Contract.KIND_MEME
-            name.startsWith("emoji_") || name.contains("emoji") -> Contract.KIND_ANIMATED_EMOJI
-            name.startsWith("sticker_") || name.contains("sticker") -> Contract.KIND_STICKER
-            name.startsWith("gif_") || ext == "gif" -> Contract.KIND_GIF
+            name.contains("meme") -> Contract.KIND_MEME
+            name.contains("emoji") -> Contract.KIND_ANIMATED_EMOJI
+            name.contains("sticker") -> Contract.KIND_STICKER
+            ext == "gif" -> Contract.KIND_GIF
             ext == "webp" -> Contract.KIND_STICKER
             else -> Contract.KIND_STICKER
         }
@@ -269,9 +474,10 @@ object LocalMediaManager {
         }
     }
 
-    fun importFiles(context: Context, uris: List<Uri>, targetKind: Int? = null): Int {
+    fun importFiles(context: Context, uris: List<Uri>, targetKind: Int? = null, packName: String? = null): Int {
         val dir = getMediaDir(context)
         var count = 0
+        val packPart = packFileNamePart(packName)
         val contentResolver = context.contentResolver
         try {
             for (uri in uris) {
@@ -286,7 +492,7 @@ object LocalMediaManager {
                         else -> displayName.substringAfterLast('.', "gif")
                     }.lowercase()
                     val rawName = displayName.substringBeforeLast('.')
-                    val safeBase = rawName.replace(SAFE_NAME_REGEX, "_").ifEmpty { "media" }
+                    val safeBase = packPart + rawName.replace(SAFE_NAME_REGEX, "_").ifEmpty { "media" }
                     val kindPrefix = when (targetKind) {
                         Contract.KIND_MEME -> "meme"
                         Contract.KIND_ANIMATED_EMOJI -> "emoji"
@@ -358,6 +564,7 @@ object LocalMediaManager {
     fun importZip(context: Context, zipUri: Uri): Int {
         val dir = getMediaDir(context)
         var count = 0
+        val packPart = packFileNamePart(queryDisplayName(context, zipUri).substringBeforeLast('.'))
         try {
             runCatching {
                 context.contentResolver.openInputStream(zipUri)?.use { input ->
@@ -366,9 +573,10 @@ object LocalMediaManager {
                         while (entry != null) {
                             val name = entry.name
                             val ext = name.substringAfterLast('.', "").lowercase()
-                            if (!entry.isDirectory && ext in SUPPORTED_EXTENSIONS) {
+                            // skip macOS resource fork junk, it is not media
+                            if (!entry.isDirectory && ext in SUPPORTED_EXTENSIONS && !name.startsWith("__MACOSX/")) {
                                 val rawBase = name.substringAfterLast('/').substringBeforeLast('.')
-                                val safeBase = rawBase.replace(SAFE_NAME_REGEX, "_").ifEmpty { "pack" }
+                                val safeBase = packPart + rawBase.replace(SAFE_NAME_REGEX, "_").ifEmpty { "pack" }
                                 val entryLower = name.lowercase()
                                 val kindPrefix = when {
                                     entryLower.contains("meme") -> "meme"
@@ -446,6 +654,7 @@ object LocalMediaManager {
         val success = file.renameTo(newFile)
         if (success) {
             localThumbsMap.values.remove(file)
+            recordMove(file, newFile)
             markDirty()
             return newFile
         }
@@ -454,6 +663,7 @@ object LocalMediaManager {
 
     fun clearAll(context: Context): Boolean {
         localThumbsMap.clear()
+        synchronized(aliasLock) { aliasFile(getMediaDir(context)).delete() }
         return getMediaDir(context).deleteRecursively().also {
             getMediaDir(context).mkdirs()
             markDirty()
@@ -463,9 +673,14 @@ object LocalMediaManager {
     fun deleteFile(file: File): Boolean {
         localThumbsMap.values.remove(file)
         return runCatching { file.delete() }.getOrDefault(false).also { deleted ->
-            if (deleted) markDirty()
+            if (deleted) {
+                forgetAliasesTo(file)
+                markDirty()
+            }
         }
     }
+
+    fun deleteFiles(files: List<File>): Int = files.count { deleteFile(it) }
 
     fun getTotalBytes(context: Context): Long {
         return getOrBuildSnapshot(context).totalBytes
