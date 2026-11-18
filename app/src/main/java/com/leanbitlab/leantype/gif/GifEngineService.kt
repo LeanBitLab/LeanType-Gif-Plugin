@@ -125,12 +125,34 @@ class GifEngineService : Service() {
 
         override fun listPacks(requestId: Int, provider: String?, pos: String?, limit: Int, cb: IGifCallback?) {
             CallerCheck.enforceHost(this@GifEngineService)
-            cb?.onError(requestId, Contract.ERR_BAD_REQUEST, "Packs not supported")
+            if (cb == null) return
+            val target = providers[provider]
+            if (target == null) {
+                cb.onError(requestId, Contract.ERR_BAD_REQUEST, "Provider '$provider' not found")
+                return
+            }
+            launchRequest(requestId, cb) {
+                when (val result = target.listPacks(pos)) {
+                    is ProviderResult.Success -> cb.onItems(requestId, result.items, result.nextOffset)
+                    is ProviderResult.Error -> cb.onError(requestId, result.errorCode, result.message)
+                }
+            }
         }
 
         override fun getPack(requestId: Int, provider: String?, packId: String?, pos: String?, limit: Int, cb: IGifCallback?) {
             CallerCheck.enforceHost(this@GifEngineService)
-            cb?.onError(requestId, Contract.ERR_BAD_REQUEST, "Packs not supported")
+            if (cb == null) return
+            val target = providers[provider]
+            if (target == null || packId == null) {
+                cb.onError(requestId, Contract.ERR_BAD_REQUEST, "Provider '$provider' or pack not found")
+                return
+            }
+            launchRequest(requestId, cb) {
+                when (val result = target.getPack(packId, pos)) {
+                    is ProviderResult.Success -> cb.onItems(requestId, result.items, result.nextOffset)
+                    is ProviderResult.Error -> cb.onError(requestId, result.errorCode, result.message)
+                }
+            }
         }
 
         override fun fetch(requestId: Int, item: GifItem?, callback: IGifCallback?) {

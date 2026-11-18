@@ -89,6 +89,41 @@ class LocalMediaManagerTest {
     }
 
     @Test
+    fun testPacksListedPerKindAndOpenedById() {
+        val ctx = testContext(tempFolder.newFolder("packs_api_root"))
+        val mediaDir = LocalMediaManager.getMediaDir(ctx)
+        val payload = ByteArray(64) { 1 }
+        fun add(name: String, modified: Long) = File(mediaDir, name).also { it.writeBytes(payload); it.setLastModified(modified) }
+        add("sticker_Cute_Cats@cat0_1_0.webp", 1_700_000_000_000L)
+        val newestCat = add("sticker_Cute_Cats@cat1_1_1.webp", 1_700_000_001_000L)
+        add("sticker_animals@dog_1_2.webp", 1_700_000_002_000L)
+        add("meme_Cute_Cats@lol_1_3.gif", 1_700_000_003_000L)
+        add("sticker_loose_1_4.webp", 1_700_000_004_000L)
+        LocalMediaManager.markDirty()
+
+        val packs = LocalMediaManager.getPacks(ctx)
+        // one tile per kind and pack, stickers before memes, names case-insensitive
+        assertEquals(
+            listOf("${Contract.KIND_STICKER}:animals", "${Contract.KIND_STICKER}:Cute Cats", "${Contract.KIND_MEME}:Cute Cats"),
+            packs.map { it.id }
+        )
+        assertTrue(packs.all { it.isPack })
+        val cats = packs[1]
+        assertEquals("Cute Cats", cats.attribution)
+        assertEquals("2", cats.extra)
+        val newestThumb = LocalMediaManager.getItems(ctx).first { it.extra == newestCat.absolutePath }.previewUri
+        assertEquals(newestThumb, cats.previewUri)
+
+        assertEquals(2, LocalMediaManager.getPackItems(ctx, cats.id)?.size)
+        assertEquals(1, LocalMediaManager.getPackItems(ctx, "${Contract.KIND_MEME}:Cute Cats")?.size)
+        // empty pack name opens the items without a pack
+        val loose = LocalMediaManager.getPackItems(ctx, LocalMediaManager.packId(Contract.KIND_STICKER, null))
+        assertEquals(listOf("loose"), loose?.map { it.attribution })
+        assertEquals(null, LocalMediaManager.getPackItems(ctx, "nope"))
+        assertEquals(null, LocalMediaManager.getPackItems(ctx, ":Cute Cats"))
+    }
+
+    @Test
     fun testPackSurvivesCategoryChangeAndGroupDelete() {
         val ctx = testContext(tempFolder.newFolder("pack_root"))
         val mediaDir = LocalMediaManager.getMediaDir(ctx)

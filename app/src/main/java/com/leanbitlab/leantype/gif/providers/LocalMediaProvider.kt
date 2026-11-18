@@ -22,7 +22,7 @@ class LocalMediaProvider(
             id = ID,
             displayName = "Local",
             kinds = Contract.KINDS_GIF or Contract.KINDS_STICKER or Contract.KINDS_MEME or Contract.KINDS_ANIMATED_EMOJI,
-            capabilities = Contract.CAP_TRENDING or Contract.CAP_SEARCH,
+            capabilities = Contract.CAP_TRENDING or Contract.CAP_SEARCH or Contract.CAP_PACKS,
             credentialFields = emptyList(),
             configured = true,
             needsNetwork = false,
@@ -41,14 +41,28 @@ class LocalMediaProvider(
             matchesKind && matchesQuery
         }
 
+        return page(filtered, offset)
+    }
+
+    private fun page(items: List<GifItem>, offset: String?): ProviderResult {
         val offsetInt = offset?.toIntOrNull() ?: 0
-        val page = filtered.drop(offsetInt).take(PAGE_SIZE)
-        val nextOffset = if (offsetInt + page.size < filtered.size) (offsetInt + page.size).toString() else null
+        val page = items.drop(offsetInt).take(PAGE_SIZE)
+        val nextOffset = if (offsetInt + page.size < items.size) (offsetInt + page.size).toString() else null
         return ProviderResult.Success(page, nextOffset)
     }
 
     override suspend fun trending(offset: String?, kind: Int): ProviderResult {
         return search("", offset, kind)
+    }
+
+    // all packs in one page: there are few and the keyboard shows them before the items
+    override suspend fun listPacks(offset: String?): ProviderResult =
+        ProviderResult.Success(LocalMediaManager.getPacks(context), null)
+
+    override suspend fun getPack(packId: String, offset: String?): ProviderResult {
+        val items = LocalMediaManager.getPackItems(context, packId)
+            ?: return ProviderResult.Error(Contract.ERR_BAD_REQUEST, "Bad pack id")
+        return page(items, offset)
     }
 
     override suspend fun resolveFullMediaUrl(item: GifItem): String? {

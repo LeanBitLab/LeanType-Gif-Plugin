@@ -171,6 +171,46 @@ object LocalMediaManager {
         return getOrBuildSnapshot(context).items
     }
 
+    private fun packOf(item: GifItem): String? = item.extra?.let { getPackName(File(it)) }
+
+    /** Id the keyboard sends back to open a pack: "<kind>:<pack name>". An empty name means the items without a pack. */
+    fun packId(kind: Int, packName: String?): String = "$kind:${packName.orEmpty()}"
+
+    /**
+     * One tile per (kind, pack), sorted by kind and then pack name. The newest item is the cover, attribution is the
+     * pack name and extra is the item count.
+     */
+    fun getPacks(context: Context): List<GifItem> {
+        val covers = HashMap<Pair<Int, String>, GifItem>()
+        val counts = HashMap<Pair<Int, String>, Int>()
+        for (item in getItems(context)) {
+            val key = item.kind to (packOf(item) ?: continue)
+            // items are newest first, so the first one seen is the cover
+            covers.getOrPut(key) { item }
+            counts[key] = (counts[key] ?: 0) + 1
+        }
+        return covers.entries
+            .sortedWith(compareBy<Map.Entry<Pair<Int, String>, GifItem>> { it.key.first }
+                .thenBy(String.CASE_INSENSITIVE_ORDER) { it.key.second })
+            .map { (key, cover) ->
+                cover.copy(
+                    id = packId(key.first, key.second),
+                    isPack = true,
+                    attribution = key.second,
+                    extra = counts[key].toString()
+                )
+            }
+    }
+
+    /** Items of the pack named by a [packId], null when the id is malformed. */
+    fun getPackItems(context: Context, packId: String): List<GifItem>? {
+        val sep = packId.indexOf(':')
+        if (sep <= 0) return null
+        val kind = packId.substring(0, sep).toIntOrNull() ?: return null
+        val pack = packId.substring(sep + 1).ifEmpty { null }
+        return getItems(context).filter { it.kind == kind && packOf(it) == pack }
+    }
+
     private fun thumbNameFor(file: File): String {
         val safeBase = file.nameWithoutExtension.replace(SAFE_NAME_REGEX, "_")
         return "loc_${safeBase}_${file.name.hashCode()}.${file.extension.lowercase()}"
