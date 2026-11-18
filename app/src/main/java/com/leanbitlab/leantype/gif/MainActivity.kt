@@ -4,6 +4,8 @@ import android.content.Context
 import android.content.Intent
 import android.content.res.Configuration
 import android.graphics.Color
+import android.graphics.ImageDecoder
+import android.graphics.drawable.AnimatedImageDrawable
 import android.net.Uri
 import android.os.Build
 import android.os.Bundle
@@ -38,6 +40,7 @@ import com.google.android.material.chip.ChipGroup
 import com.google.android.material.color.DynamicColors
 import com.google.android.material.color.MaterialColors
 import com.google.android.material.dialog.MaterialAlertDialogBuilder
+import com.google.android.material.materialswitch.MaterialSwitch
 import com.leanbitlab.leantype.gif.storage.LocalMediaManager
 import com.leanbitlab.leantype.gif.storage.ThumbRegistry
 import kotlinx.coroutines.CoroutineScope
@@ -64,6 +67,7 @@ class MainActivity : AppCompatActivity() {
     private lateinit var groupAdapter: ConcatAdapter
 
     private var allItems: List<GifItem> = emptyList()
+    private var packOrder: List<String> = emptyList()
     // null shows the category overview, otherwise the full grid of that kind
     private var openKind: Int? = null
     // null is every pack of the open kind, NO_PACK is the files imported without a pack
@@ -145,6 +149,7 @@ class MainActivity : AppCompatActivity() {
 
         mediaAdapter = LocalMediaAdapter(
             thumbLoader = getThumbLoader(applicationContext),
+            scope = scope,
             showKindBadge = false,
             onItemLongClick = { item -> toggleSelection(item) },
             onItemClick = { item, file ->
@@ -158,8 +163,14 @@ class MainActivity : AppCompatActivity() {
                 render()
                 recyclerViewMedia.scrollToPosition(0)
             },
-            onDeleteClick = { showDeleteGroupDialog() }
+            onDeleteClick = { showDeleteGroupDialog() },
+            onPackLongClick = { pack -> showPackActionsDialog(pack) },
+            onAutoplayChanged = { on ->
+                getSharedPreferences(PREFS_NAME, MODE_PRIVATE).edit().putBoolean(PREF_AUTOPLAY, on).apply()
+                mediaAdapter.setAutoplay(on)
+            }
         )
+        mediaAdapter.setAutoplay(isAutoplayEnabled())
         homeAdapter = ConcatAdapter(headerAdapter, categoryAdapter)
         groupAdapter = ConcatAdapter(groupHeaderAdapter, mediaAdapter)
 
@@ -286,6 +297,7 @@ class MainActivity : AppCompatActivity() {
                 val registry = ThumbRegistry(applicationContext)
                 val loaded = LocalMediaManager.getItems(applicationContext, registry)
                 val bytes = LocalMediaManager.getTotalBytes(applicationContext)
+                packOrder = LocalMediaManager.getPackOrder(applicationContext)
                 loaded to bytes
             }
 
@@ -376,7 +388,7 @@ class MainActivity : AppCompatActivity() {
         val chips = ArrayList<Pair<String?, String>>()
         if (packCounts.isNotEmpty()) {
             chips.add(null to "All (${ofKind.size})")
-            for ((pack, n) in packCounts.entries.sortedWith(compareBy(String.CASE_INSENSITIVE_ORDER) { it.key })) chips.add(pack to "$pack ($n)")
+            for (pack in LocalMediaManager.sortPacks(packCounts.keys, packOrder)) chips.add(pack to "$pack (${packCounts[pack]})")
             if (unpacked > 0) chips.add(NO_PACK to "No pack ($unpacked)")
         }
         val shown = shownItems()
@@ -386,7 +398,8 @@ class MainActivity : AppCompatActivity() {
                 summary = countLabel(shown.size, "item", "items") + " - long press to select",
                 deleteLabel = if (inPack) "Delete pack" else "Delete all",
                 chips = chips,
-                selected = openPack
+                selected = openPack,
+                autoplay = isAutoplayEnabled()
             )
         )
         toolbar.title = kindLabel(activeKind)
@@ -512,6 +525,46 @@ class MainActivity : AppCompatActivity() {
             }
             .setNegativeButton("Cancel", null)
             .show()
+    }
+
+    private fun isAutoplayEnabled(): Boolean = Build.VERSION.SDK_INT >= Build.VERSION_CODES.P &&
+        getSharedPreferences(PREFS_NAME, MODE_PRIVATE).getBoolean(PREF_AUTOPLAY, false)
+
+    /** Rename or move a pack of the open category; long press on its chip. */
+    private fun showPackActionsDialog(pack: String) {
+        val kind = openKind ?: return
+        val packs = LocalMediaManager.sortPacks(allItems.filter { it.kind == kind }.mapNotNull { packOf(it) }.toSet(), packOrder)
+        val index = packs.indexOf(pack)
+        if (index < 0) return
+        val actions = ArrayList<Pair<String, () -> Unit>>()
+        actions.add("Rename pack" to {
+            showTextInputDialog("Pack Name", "Pack name", pack, "Rename") { name ->
+                scope.launch {
+                    val result = withContext(Dispatchers.IO) { LocalMediaManager.renamePack(applicationContext, kind, pack, name) }
+                    val message = when {
+                        result == null -> "Could not rename, the name is not usable"
+                        result.first == 0 -> "Could not rename the pack"
+                        else -> "Renamed ${result.first} items"
+                    }
+                    if (result != null && result.first > 0 && openPack == pack) openPack = result.second
+                    Toast.makeText(this@MainActivity, message, Toast.LENGTH_SHORT).show()
+                    refreshData()
+                }
+            }
+        })
+        if (index > 0) actions.add("Move left" to { movePack(packs, pack, -1) })
+        if (index < packs.size - 1) actions.add("Move right" to { movePack(packs, pack, 1) })
+        MaterialAlertDialogBuilder(this)
+            .setTitle(pack)
+            .setItems(actions.map { it.first }.toTypedArray()) { _, which -> actions[which].second() }
+            .show()
+    }
+
+    private fun movePack(packs: List<String>, pack: String, offset: Int) {
+        scope.launch {
+            withContext(Dispatchers.IO) { LocalMediaManager.movePack(applicationContext, packs, pack, offset) }
+            refreshData()
+        }
     }
 
     private fun showDeleteGroupDialog() {
@@ -696,12 +749,23 @@ class MainActivity : AppCompatActivity() {
 
     class LocalMediaAdapter(
         private val thumbLoader: ImageLoader,
+        private val scope: CoroutineScope,
         private val showKindBadge: Boolean = true,
         private val onItemLongClick: (GifItem) -> Unit = {},
         private val onItemClick: (GifItem, File) -> Unit
     ) : ListAdapter<GifItem, LocalMediaAdapter.MediaViewHolder>(DiffCallback()) {
 
         private var selection: Set<String> = emptySet()
+        // play animated items while their tile is on screen; Android 9+ only (AnimatedImageDrawable)
+        private var autoplay = false
+        private val attachedHolders = HashSet<MediaViewHolder>()
+
+        fun setAutoplay(on: Boolean) {
+            val enabled = on && Build.VERSION.SDK_INT >= Build.VERSION_CODES.P
+            if (autoplay == enabled) return
+            autoplay = enabled
+            for (holder in attachedHolders) if (enabled) holder.startLive() else holder.stopLive(reload = true)
+        }
 
         fun setSelection(newSelection: Set<String>) {
             if (selection == newSelection) return
@@ -722,6 +786,18 @@ class MainActivity : AppCompatActivity() {
             if (payloads.isNotEmpty()) holder.bindSelection(getItem(position)) else super.onBindViewHolder(holder, position, payloads)
         }
 
+        override fun onViewAttachedToWindow(holder: MediaViewHolder) {
+            super.onViewAttachedToWindow(holder)
+            attachedHolders.add(holder)
+            holder.startLive()
+        }
+
+        override fun onViewDetachedFromWindow(holder: MediaViewHolder) {
+            super.onViewDetachedFromWindow(holder)
+            attachedHolders.remove(holder)
+            holder.stopLive(reload = false)
+        }
+
         override fun onViewRecycled(holder: MediaViewHolder) {
             super.onViewRecycled(holder)
             holder.unbind()
@@ -738,12 +814,56 @@ class MainActivity : AppCompatActivity() {
                 ivThumbnail.alpha = if (isSelected) 0.5f else 1f
             }
 
-            fun bind(item: GifItem) {
-                val file = File(item.extra)
+            private var boundFile: File? = null
+            private var liveJob: Job? = null
+
+            private fun loadStatic(file: File) {
                 ivThumbnail.load(file, thumbLoader) {
                     size(256, 256)
                     precision(Precision.INEXACT)
                 }
+            }
+
+            /** Decodes the bound file downsampled to the tile and plays it; only while attached, so off-screen tiles cost nothing. */
+            fun startLive() {
+                if (!autoplay || Build.VERSION.SDK_INT < Build.VERSION_CODES.P) return
+                (ivThumbnail.drawable as? AnimatedImageDrawable)?.let { it.start(); return }
+                val file = boundFile ?: return
+                liveJob?.cancel()
+                liveJob = scope.launch {
+                    val drawable = withContext(Dispatchers.IO) {
+                        runCatching {
+                            ImageDecoder.decodeDrawable(ImageDecoder.createSource(file)) { decoder, info, _ ->
+                                val longest = maxOf(info.size.width, info.size.height)
+                                if (longest > LIVE_SIZE) {
+                                    decoder.setTargetSize(info.size.width * LIVE_SIZE / longest, info.size.height * LIVE_SIZE / longest)
+                                }
+                            }
+                        }.getOrNull()
+                    }
+                    if (drawable !is AnimatedImageDrawable || boundFile != file || !itemView.isAttachedToWindow) return@launch
+                    ivThumbnail.dispose()
+                    ivThumbnail.setImageDrawable(drawable)
+                    drawable.start()
+                }
+            }
+
+            /** Stops decoding frames; [reload] puts the static thumbnail back when autoplay is turned off. */
+            fun stopLive(reload: Boolean) {
+                liveJob?.cancel()
+                liveJob = null
+                if (Build.VERSION.SDK_INT < Build.VERSION_CODES.P) return
+                val live = ivThumbnail.drawable as? AnimatedImageDrawable ?: return
+                live.stop()
+                if (reload) boundFile?.let { loadStatic(it) }
+            }
+
+            fun bind(item: GifItem) {
+                val file = File(item.extra)
+                stopLive(reload = false)
+                boundFile = file
+                loadStatic(file)
+                if (itemView.isAttachedToWindow) startLive()
 
                 tvKindBadge.visibility = if (showKindBadge) View.VISIBLE else View.GONE
                 tvKindBadge.text = when (item.kind) {
@@ -764,6 +884,8 @@ class MainActivity : AppCompatActivity() {
             }
 
             fun unbind() {
+                stopLive(reload = false)
+                boundFile = null
                 ivThumbnail.dispose()
                 ivThumbnail.setImageDrawable(null)
             }
@@ -830,7 +952,9 @@ class MainActivity : AppCompatActivity() {
     /** Pack filter chips, item count and the delete action above the grid of an open category. */
     private class GroupHeaderAdapter(
         private val onPackSelected: (String?) -> Unit,
-        private val onDeleteClick: () -> Unit
+        private val onDeleteClick: () -> Unit,
+        private val onPackLongClick: (String) -> Unit,
+        private val onAutoplayChanged: (Boolean) -> Unit
     ) : RecyclerView.Adapter<GroupHeaderAdapter.GroupViewHolder>() {
 
         class Model(
@@ -838,7 +962,8 @@ class MainActivity : AppCompatActivity() {
             val deleteLabel: String,
             /** key (null is all) to label, empty when the category has no packs */
             val chips: List<Pair<String?, String>>,
-            val selected: String?
+            val selected: String?,
+            val autoplay: Boolean
         )
 
         private var model: Model? = null
@@ -864,14 +989,20 @@ class MainActivity : AppCompatActivity() {
             private val chipGroup: ChipGroup = itemView.findViewById(R.id.chipGroupPacks)
             private val tvSummary: TextView = itemView.findViewById(R.id.tvGroupSummary)
             private val btnDelete: MaterialButton = itemView.findViewById(R.id.btnDeleteGroup)
+            private val switchAutoplay: MaterialSwitch = itemView.findViewById(R.id.switchAutoplay)
 
             init {
                 btnDelete.setOnClickListener { onDeleteClick() }
+                // animated previews need AnimatedImageDrawable (Android 9+), so the switch is greyed out below that
+                switchAutoplay.isEnabled = Build.VERSION.SDK_INT >= Build.VERSION_CODES.P
             }
 
             fun bind(m: Model) {
                 tvSummary.text = m.summary
                 btnDelete.text = m.deleteLabel
+                switchAutoplay.setOnCheckedChangeListener(null)
+                switchAutoplay.isChecked = m.autoplay
+                switchAutoplay.setOnCheckedChangeListener { _, on -> onAutoplayChanged(on) }
                 chipGroup.removeAllViews()
                 scrollPacks.visibility = if (m.chips.isEmpty()) View.GONE else View.VISIBLE
                 val inflater = LayoutInflater.from(itemView.context)
@@ -881,6 +1012,7 @@ class MainActivity : AppCompatActivity() {
                     chip.text = label
                     chip.isChecked = key == m.selected
                     chip.setOnClickListener { onPackSelected(key) }
+                    if (key != null && key != NO_PACK) chip.setOnLongClickListener { onPackLongClick(key); true }
                     chipGroup.addView(chip)
                 }
             }
@@ -893,6 +1025,10 @@ class MainActivity : AppCompatActivity() {
         private val SELECTION_PAYLOAD = Any()
         private const val STATE_KIND = "open_kind"
         private const val STATE_PACK = "open_pack"
+        private const val PREFS_NAME = "settings"
+        private const val PREF_AUTOPLAY = "autoplay_previews"
+        /** Longest side, in px, animated tiles are decoded at; far below the source size to keep decoding cheap. */
+        private const val LIVE_SIZE = 256
 
         @Volatile
         private var sharedThumbLoader: ImageLoader? = null

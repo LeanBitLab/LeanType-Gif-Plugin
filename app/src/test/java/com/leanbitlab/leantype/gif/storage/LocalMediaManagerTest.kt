@@ -256,4 +256,37 @@ class LocalMediaManagerTest {
         assertTrue(LocalMediaManager.clearAll(ctx))
         assertTrue(!aliasFile.exists())
     }
+
+    @Test
+    fun testPackRenameAndOrder() {
+        val ctx = testContext(tempFolder.newFolder("pack_rename_order_root"))
+        val mediaDir = LocalMediaManager.getMediaDir(ctx)
+        val payload = ByteArray(64) { 1 }
+        fun add(name: String) = File(mediaDir, name).also { it.writeBytes(payload) }
+        add("sticker_animals@dog_1_0.webp")
+        add("sticker_Cute_Cats@cat0_1_1.webp")
+        add("sticker_Cute_Cats@cat1_1_2.webp")
+        add("meme_Cute_Cats@lol_1_3.gif")
+        add("sticker_zoo@lion_1_4.webp")
+        LocalMediaManager.markDirty()
+        fun stickerPacks() = LocalMediaManager.getPacks(ctx).filter { it.kind == Contract.KIND_STICKER }.mapNotNull { it.attribution }
+
+        // without a saved order packs are sorted by name
+        assertEquals(listOf("animals", "Cute Cats", "zoo"), stickerPacks())
+        assertTrue(LocalMediaManager.movePack(ctx, stickerPacks(), "zoo", -2))
+        assertEquals(listOf("zoo", "animals", "Cute Cats"), stickerPacks())
+        assertTrue(!LocalMediaManager.movePack(ctx, stickerPacks(), "zoo", -1))
+
+        // rename keeps the position and only touches the given kind
+        assertEquals(2 to "Funny Cats", LocalMediaManager.renamePack(ctx, Contract.KIND_STICKER, "Cute Cats", "Funny Cats"))
+        assertEquals(listOf("zoo", "animals", "Funny Cats"), stickerPacks())
+        assertEquals(1, LocalMediaManager.getPackItems(ctx, "${Contract.KIND_MEME}:Cute Cats")?.size)
+        // an unusable name never moves files out of their pack
+        assertEquals(null, LocalMediaManager.renamePack(ctx, Contract.KIND_STICKER, "zoo", " @! "))
+        assertEquals(listOf("zoo", "animals", "Funny Cats"), stickerPacks())
+        // renaming to an existing pack merges them
+        assertEquals(1 to "animals", LocalMediaManager.renamePack(ctx, Contract.KIND_STICKER, "zoo", "animals"))
+        assertEquals(listOf("animals", "Funny Cats"), stickerPacks())
+        assertEquals(2, LocalMediaManager.getPackItems(ctx, "${Contract.KIND_STICKER}:animals")?.size)
+    }
 }

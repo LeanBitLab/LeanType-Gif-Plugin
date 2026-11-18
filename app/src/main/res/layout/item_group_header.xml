@@ -43,6 +43,13 @@
             android:textStyle="bold"
             android:textColor="?attr/colorPrimary" />
 
+        <com.google.android.material.materialswitch.MaterialSwitch
+            android:id="@+id/switchAutoplay"
+            android:layout_width="wrap_content"
+            android:layout_height="wrap_content"
+            android:layout_marginStart="8dp"
+            android:text="Preview" />
+
         <com.google.android.material.button.MaterialButton
             android:id="@+id/btnDeleteGroup"
             style="@style/Widget.Material3.Button.TextButton"

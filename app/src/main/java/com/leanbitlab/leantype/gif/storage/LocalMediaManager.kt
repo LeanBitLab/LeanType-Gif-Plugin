@@ -24,6 +24,7 @@ object LocalMediaManager {
     private const val MAX_PACK_LENGTH = 40
     private const val MAX_TITLE_LENGTH = 60
     private const val ALIAS_FILE_NAME = "local_media_aliases.txt"
+    private const val PACK_ORDER_FILE_NAME = "local_media_pack_order.txt"
     private const val MAX_ALIAS_HOPS = 8
     private val aliasLock = Any()
 
@@ -176,9 +177,62 @@ object LocalMediaManager {
     /** Id the keyboard sends back to open a pack: "<kind>:<pack name>". An empty name means the items without a pack. */
     fun packId(kind: Int, packName: String?): String = "$kind:${packName.orEmpty()}"
 
+    private fun packOrderFile(context: Context) = File(context.filesDir, PACK_ORDER_FILE_NAME)
+
+    /** Pack names in the order the user arranged them, one per line. Packs never moved are not listed. */
+    fun getPackOrder(context: Context): List<String> = runCatching {
+        packOrderFile(context).takeIf { it.exists() }?.readLines()?.map { it.trim() }?.filter { it.isNotEmpty() }
+    }.getOrNull().orEmpty()
+
+    private fun writePackOrder(context: Context, order: List<String>) {
+        val file = packOrderFile(context)
+        val tmp = File(file.parentFile, "$PACK_ORDER_FILE_NAME.tmp")
+        runCatching {
+            tmp.writeText(order.distinct().joinToString("\n"))
+            if (!tmp.renameTo(file)) tmp.delete()
+        }
+    }
+
+    /** Pack names sorted by the saved [order]; packs missing from it follow, sorted by name. */
+    fun sortPacks(names: Collection<String>, order: List<String>): List<String> =
+        names.sortedWith(compareBy<String> { order.indexOf(it).let { i -> if (i < 0) Int.MAX_VALUE else i } }
+            .thenBy(String.CASE_INSENSITIVE_ORDER) { it })
+
     /**
-     * One tile per (kind, pack), sorted by kind and then pack name. The newest item is the cover, attribution is the
-     * pack name and extra is the item count.
+     * Moves [pack] by [offset] places within [shown], the packs in the order they are displayed now, and saves it.
+     * Packs of other kinds keep their saved order after the shown ones.
+     */
+    fun movePack(context: Context, shown: List<String>, pack: String, offset: Int): Boolean {
+        val from = shown.indexOf(pack)
+        val to = from + offset
+        if (from < 0 || to !in shown.indices) return false
+        val reordered = shown.toMutableList().apply { add(to, removeAt(from)) }
+        writePackOrder(context, reordered + getPackOrder(context).filter { it !in reordered })
+        markDirty()
+        return true
+    }
+
+    /**
+     * Renames the pack [oldName] of [kind] by moving its files into [newName]; an existing pack of that name is merged.
+     * Returns the number of files moved and the new pack name, or null when the new name is unusable.
+     */
+    fun renamePack(context: Context, kind: Int, oldName: String, newName: String): Pair<Int, String>? {
+        val part = packFileNamePart(newName)
+        if (part.isEmpty()) return null
+        val displayName = part.removeSuffix(PACK_DELIMITER.toString()).replace('_', ' ').trim()
+        val files = getItems(context).filter { it.kind == kind && packOf(it) == oldName }.mapNotNull { it.extra?.let(::File) }
+        val moved = files.count { setPack(it, newName) != null }
+        if (moved > 0) {
+            val order = getPackOrder(context)
+            val renamed = order.map { if (it == oldName) displayName else it }
+            if (renamed != order) writePackOrder(context, renamed)
+        }
+        return moved to displayName
+    }
+
+    /**
+     * One tile per (kind, pack), sorted by kind and then by the user's pack order (see [sortPacks]). The newest item
+     * is the cover, attribution is the pack name and extra is the item count.
      */
     fun getPacks(context: Context): List<GifItem> {
         val covers = HashMap<Pair<Int, String>, GifItem>()
@@ -189,9 +243,10 @@ object LocalMediaManager {
             covers.getOrPut(key) { item }
             counts[key] = (counts[key] ?: 0) + 1
         }
+        val order = getPackOrder(context)
+        val rank = sortPacks(covers.keys.map { it.second }.toSet(), order).withIndex().associate { it.value to it.index }
         return covers.entries
-            .sortedWith(compareBy<Map.Entry<Pair<Int, String>, GifItem>> { it.key.first }
-                .thenBy(String.CASE_INSENSITIVE_ORDER) { it.key.second })
+            .sortedWith(compareBy<Map.Entry<Pair<Int, String>, GifItem>> { it.key.first }.thenBy { rank[it.key.second] })
             .map { (key, cover) ->
                 cover.copy(
                     id = packId(key.first, key.second),
