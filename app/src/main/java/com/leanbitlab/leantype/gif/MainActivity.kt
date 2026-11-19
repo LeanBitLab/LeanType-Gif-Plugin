@@ -2,6 +2,7 @@ package com.leanbitlab.leantype.gif
 
 import android.content.Context
 import android.content.Intent
+import android.content.res.ColorStateList
 import android.content.res.Configuration
 import android.graphics.Color
 import android.graphics.ImageDecoder
@@ -15,12 +16,15 @@ import android.view.View
 import android.view.ViewGroup
 import android.widget.EditText
 import android.widget.FrameLayout
+import android.widget.ImageButton
 import android.widget.ImageView
+import android.widget.PopupWindow
 import android.widget.TextView
 import android.widget.Toast
 import androidx.activity.OnBackPressedCallback
 import androidx.activity.result.contract.ActivityResultContracts
 import androidx.appcompat.app.AppCompatActivity
+import androidx.appcompat.widget.TooltipCompat
 import androidx.core.view.WindowCompat
 import androidx.recyclerview.widget.ConcatAdapter
 import androidx.recyclerview.widget.DiffUtil
@@ -58,6 +62,7 @@ class MainActivity : AppCompatActivity() {
     private var refreshJob: Job? = null
 
     private lateinit var toolbar: MaterialToolbar
+    private lateinit var switchAutoplay: MaterialSwitch
     private lateinit var recyclerViewMedia: RecyclerView
     private lateinit var headerAdapter: HeaderAdapter
     private lateinit var mediaAdapter: LocalMediaAdapter
@@ -127,6 +132,14 @@ class MainActivity : AppCompatActivity() {
         }
 
         toolbar = findViewById(R.id.toolbar)
+        switchAutoplay = findViewById(R.id.switchAutoplay)
+        // animated previews need AnimatedImageDrawable (Android 9+), so the switch is greyed out below that
+        switchAutoplay.isEnabled = Build.VERSION.SDK_INT >= Build.VERSION_CODES.P
+        switchAutoplay.isChecked = isAutoplayEnabled()
+        switchAutoplay.setOnCheckedChangeListener { _, on ->
+            getSharedPreferences(PREFS_NAME, MODE_PRIVATE).edit().putBoolean(PREF_AUTOPLAY, on).apply()
+            mediaAdapter.setAutoplay(on)
+        }
         recyclerViewMedia = findViewById(R.id.recyclerViewMedia)
 
         toolbar.setNavigationOnClickListener {
@@ -163,12 +176,7 @@ class MainActivity : AppCompatActivity() {
                 render()
                 recyclerViewMedia.scrollToPosition(0)
             },
-            onDeleteClick = { showDeleteGroupDialog() },
-            onPackLongClick = { pack -> showPackActionsDialog(pack) },
-            onAutoplayChanged = { on ->
-                getSharedPreferences(PREFS_NAME, MODE_PRIVATE).edit().putBoolean(PREF_AUTOPLAY, on).apply()
-                mediaAdapter.setAutoplay(on)
-            }
+            onChipLongClick = { anchor, pack -> showPackActionsDialog(anchor, pack) }
         )
         mediaAdapter.setAutoplay(isAutoplayEnabled())
         homeAdapter = ConcatAdapter(headerAdapter, categoryAdapter)
@@ -316,7 +324,6 @@ class MainActivity : AppCompatActivity() {
         else -> "GIFs"
     }
 
-    private fun countLabel(count: Int, one: String, many: String): String = "$count ${if (count == 1) one else many}"
 
     private fun openCategory(kind: Int) {
         openKind = kind
@@ -332,13 +339,13 @@ class MainActivity : AppCompatActivity() {
         render()
     }
 
-    private fun shownItems(): List<GifItem> {
+    private fun shownItems(pack: String? = openPack): List<GifItem> {
         val kind = openKind ?: return emptyList()
         val ofKind = allItems.filter { it.kind == kind }
-        return when (openPack) {
+        return when (pack) {
             null -> ofKind
             NO_PACK -> ofKind.filter { packOf(it) == null }
-            else -> ofKind.filter { packOf(it) == openPack }
+            else -> ofKind.filter { packOf(it) == pack }
         }
     }
 
@@ -392,16 +399,7 @@ class MainActivity : AppCompatActivity() {
             if (unpacked > 0) chips.add(NO_PACK to "No pack ($unpacked)")
         }
         val shown = shownItems()
-        val inPack = openPack != null && openPack != NO_PACK
-        groupHeaderAdapter.submit(
-            GroupHeaderAdapter.Model(
-                summary = countLabel(shown.size, "item", "items") + " - long press to select",
-                deleteLabel = if (inPack) "Delete pack" else "Delete all",
-                chips = chips,
-                selected = openPack,
-                autoplay = isAutoplayEnabled()
-            )
-        )
+        groupHeaderAdapter.submit(GroupHeaderAdapter.Model(chips = chips, selected = openPack))
         toolbar.title = kindLabel(activeKind)
         mediaAdapter.submitList(shown)
         showAdapter(groupAdapter)
@@ -427,6 +425,7 @@ class MainActivity : AppCompatActivity() {
             toolbar.title = "${selected.size} selected"
             toolbar.setNavigationIcon(R.drawable.ic_close)
             toolbar.navigationContentDescription = "Clear selection"
+            switchAutoplay.visibility = View.GONE
             if (toolbar.menu.size() == 0) toolbar.inflateMenu(R.menu.menu_selection)
             toolbar.menu.findItem(R.id.action_rename)?.isVisible = selected.size == 1
         } else {
@@ -434,6 +433,7 @@ class MainActivity : AppCompatActivity() {
             toolbar.setNavigationIcon(R.drawable.ic_arrow_back)
             toolbar.navigationContentDescription = "Back"
             toolbar.menu.clear()
+            switchAutoplay.visibility = if (openKind != null) View.VISIBLE else View.GONE
         }
     }
 
@@ -530,14 +530,22 @@ class MainActivity : AppCompatActivity() {
     private fun isAutoplayEnabled(): Boolean = Build.VERSION.SDK_INT >= Build.VERSION_CODES.P &&
         getSharedPreferences(PREFS_NAME, MODE_PRIVATE).getBoolean(PREF_AUTOPLAY, false)
 
-    /** Rename or move a pack of the open category; long press on its chip. */
-    private fun showPackActionsDialog(pack: String) {
+    /** Actions for a chip of the open category on long press: rename, move or delete a pack; delete All / No pack. */
+    private fun showPackActionsDialog(anchor: View, pack: String?) {
         val kind = openKind ?: return
+        if (pack == null || pack == NO_PACK) {
+            showActionsPopup(anchor, listOf(
+                PackAction(if (pack == null) "Delete all" else "Delete items without a pack", R.drawable.ic_delete, true) {
+                    showDeleteGroupDialog(pack)
+                }
+            ))
+            return
+        }
         val packs = LocalMediaManager.sortPacks(allItems.filter { it.kind == kind }.mapNotNull { packOf(it) }.toSet(), packOrder)
         val index = packs.indexOf(pack)
         if (index < 0) return
-        val actions = ArrayList<Pair<String, () -> Unit>>()
-        actions.add("Rename pack" to {
+        val actions = ArrayList<PackAction>()
+        actions.add(PackAction("Rename pack", R.drawable.ic_edit) {
             showTextInputDialog("Pack Name", "Pack name", pack, "Rename") { name ->
                 scope.launch {
                     val result = withContext(Dispatchers.IO) { LocalMediaManager.renamePack(applicationContext, kind, pack, name) }
@@ -552,12 +560,34 @@ class MainActivity : AppCompatActivity() {
                 }
             }
         })
-        if (index > 0) actions.add("Move left" to { movePack(packs, pack, -1) })
-        if (index < packs.size - 1) actions.add("Move right" to { movePack(packs, pack, 1) })
-        MaterialAlertDialogBuilder(this)
-            .setTitle(pack)
-            .setItems(actions.map { it.first }.toTypedArray()) { _, which -> actions[which].second() }
-            .show()
+        if (index > 0) actions.add(PackAction("Move left", R.drawable.ic_arrow_back) { movePack(packs, pack, -1) })
+        if (index < packs.size - 1) actions.add(PackAction("Move right", R.drawable.ic_arrow_forward) { movePack(packs, pack, 1) })
+        actions.add(PackAction("Delete pack", R.drawable.ic_delete, true) { showDeleteGroupDialog(pack) })
+        showActionsPopup(anchor, actions)
+    }
+
+    private class PackAction(val label: String, val icon: Int, val destructive: Boolean = false, val run: () -> Unit)
+
+    /** Icon-only actions popup below the long-pressed chip; labels as tooltips, destructive icons in the error color. */
+    private fun showActionsPopup(anchor: View, actions: List<PackAction>) {
+        val view = layoutInflater.inflate(R.layout.popup_pack_actions, null)
+        val popup = PopupWindow(view, ViewGroup.LayoutParams.WRAP_CONTENT, ViewGroup.LayoutParams.WRAP_CONTENT, true)
+        val container = view.findViewById<ViewGroup>(R.id.popupActions)
+        val normal = MaterialColors.getColor(anchor, com.google.android.material.R.attr.colorOnSurface)
+        val error = MaterialColors.getColor(anchor, androidx.appcompat.R.attr.colorError)
+        for (action in actions) {
+            val button = layoutInflater.inflate(R.layout.item_popup_action, container, false) as ImageButton
+            button.setImageResource(action.icon)
+            button.imageTintList = ColorStateList.valueOf(if (action.destructive) error else normal)
+            button.contentDescription = action.label
+            TooltipCompat.setTooltipText(button, action.label)
+            button.setOnClickListener {
+                popup.dismiss()
+                action.run()
+            }
+            container.addView(button)
+        }
+        popup.showAsDropDown(anchor)
     }
 
     private fun movePack(packs: List<String>, pack: String, offset: Int) {
@@ -567,11 +597,10 @@ class MainActivity : AppCompatActivity() {
         }
     }
 
-    private fun showDeleteGroupDialog() {
-        val targets = shownItems()
+    private fun showDeleteGroupDialog(pack: String?) {
+        val targets = shownItems(pack)
         if (targets.isEmpty()) return
         val kind = openKind ?: return
-        val pack = openPack
         val what = when {
             pack == null -> "all ${targets.size} ${kindLabel(kind)}"
             pack == NO_PACK -> "${targets.size} ${kindLabel(kind)} without a pack"
@@ -952,18 +981,13 @@ class MainActivity : AppCompatActivity() {
     /** Pack filter chips, item count and the delete action above the grid of an open category. */
     private class GroupHeaderAdapter(
         private val onPackSelected: (String?) -> Unit,
-        private val onDeleteClick: () -> Unit,
-        private val onPackLongClick: (String) -> Unit,
-        private val onAutoplayChanged: (Boolean) -> Unit
+        private val onChipLongClick: (View, String?) -> Unit
     ) : RecyclerView.Adapter<GroupHeaderAdapter.GroupViewHolder>() {
 
         class Model(
-            val summary: String,
-            val deleteLabel: String,
             /** key (null is all) to label, empty when the category has no packs */
             val chips: List<Pair<String?, String>>,
-            val selected: String?,
-            val autoplay: Boolean
+            val selected: String?
         )
 
         private var model: Model? = null
@@ -987,22 +1011,8 @@ class MainActivity : AppCompatActivity() {
         inner class GroupViewHolder(itemView: View) : RecyclerView.ViewHolder(itemView) {
             private val scrollPacks: View = itemView.findViewById(R.id.scrollPacks)
             private val chipGroup: ChipGroup = itemView.findViewById(R.id.chipGroupPacks)
-            private val tvSummary: TextView = itemView.findViewById(R.id.tvGroupSummary)
-            private val btnDelete: MaterialButton = itemView.findViewById(R.id.btnDeleteGroup)
-            private val switchAutoplay: MaterialSwitch = itemView.findViewById(R.id.switchAutoplay)
-
-            init {
-                btnDelete.setOnClickListener { onDeleteClick() }
-                // animated previews need AnimatedImageDrawable (Android 9+), so the switch is greyed out below that
-                switchAutoplay.isEnabled = Build.VERSION.SDK_INT >= Build.VERSION_CODES.P
-            }
 
             fun bind(m: Model) {
-                tvSummary.text = m.summary
-                btnDelete.text = m.deleteLabel
-                switchAutoplay.setOnCheckedChangeListener(null)
-                switchAutoplay.isChecked = m.autoplay
-                switchAutoplay.setOnCheckedChangeListener { _, on -> onAutoplayChanged(on) }
                 chipGroup.removeAllViews()
                 scrollPacks.visibility = if (m.chips.isEmpty()) View.GONE else View.VISIBLE
                 val inflater = LayoutInflater.from(itemView.context)
@@ -1012,7 +1022,7 @@ class MainActivity : AppCompatActivity() {
                     chip.text = label
                     chip.isChecked = key == m.selected
                     chip.setOnClickListener { onPackSelected(key) }
-                    if (key != null && key != NO_PACK) chip.setOnLongClickListener { onPackLongClick(key); true }
+                    chip.setOnLongClickListener { onChipLongClick(it, key); true }
                     chipGroup.addView(chip)
                 }
             }
