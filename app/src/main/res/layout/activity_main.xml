@@ -21,7 +21,19 @@
             app:navigationContentDescription="Back"
             app:title="Offline Media"
             app:titleTextAppearance="?attr/textAppearanceTitleLarge"
-            app:titleTextColor="?attr/colorOnSurface" />
+            app:titleTextColor="?attr/colorOnSurface">
+
+            <!-- animated previews in a category, shown at the end of its heading -->
+            <com.google.android.material.materialswitch.MaterialSwitch
+                android:id="@+id/switchAutoplay"
+                android:layout_width="wrap_content"
+                android:layout_height="wrap_content"
+                android:layout_gravity="end|center_vertical"
+                android:layout_marginEnd="12dp"
+                android:text="Preview"
+                android:visibility="gone" />
+
+        </com.google.android.material.appbar.MaterialToolbar>
 
     </com.google.android.material.appbar.AppBarLayout>
 
