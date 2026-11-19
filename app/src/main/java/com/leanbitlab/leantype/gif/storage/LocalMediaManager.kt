@@ -18,7 +18,12 @@ import java.util.concurrent.atomic.AtomicLong
 import java.util.zip.ZipInputStream
 
 object LocalMediaManager {
-    private val SAFE_NAME_REGEX = Regex("[^a-zA-Z0-9_-]")
+    /** Letters and digits of any script (Reação, Ñandú), so pack names and titles keep their accents. */
+    private val SAFE_NAME_REGEX = Regex("[^\\p{L}\\p{M}\\p{N}_-]")
+    /** Thumbnail names stay ASCII: ThumbnailProvider only serves [a-zA-Z0-9_-] names. */
+    private val THUMB_NAME_REGEX = Regex("[^a-zA-Z0-9_-]")
+    /** File names are limited to 255 bytes, and accented or non-Latin letters take 2-4 bytes each in UTF-8. */
+    private const val MAX_NAME_PART_BYTES = 100
     private val SUPPORTED_EXTENSIONS = setOf("gif", "webp", "png", "jpg", "jpeg")
     private val KIND_PREFIXES = listOf("meme_", "emoji_", "sticker_", "gif_")
     private const val MAX_PACK_LENGTH = 40
@@ -267,7 +272,7 @@ object LocalMediaManager {
     }
 
     private fun thumbNameFor(file: File): String {
-        val safeBase = file.nameWithoutExtension.replace(SAFE_NAME_REGEX, "_")
+        val safeBase = file.nameWithoutExtension.replace(THUMB_NAME_REGEX, "_")
         return "loc_${safeBase}_${file.name.hashCode()}.${file.extension.lowercase()}"
     }
 
@@ -419,11 +424,7 @@ object LocalMediaManager {
 
     /** Changes the title, keeping kind, pack and the unique stamp. Null when the new title is unusable. */
     fun renameTitle(file: File, newTitle: String): File? {
-        val safe = newTitle
-            .replace(SAFE_NAME_REGEX, "_")
-            .replace(Regex("_+"), "_")
-            .trim('_', '-')
-            .take(MAX_TITLE_LENGTH)
+        val safe = safeNamePart(newTitle, MAX_TITLE_LENGTH)
         if (safe.isEmpty()) return null
         val packRaw = parseStoredName(file).packRaw
         return renameStored(file, if (packRaw == null) "" else "$packRaw$PACK_DELIMITER", safe)
@@ -438,13 +439,33 @@ object LocalMediaManager {
         return rest.substring(0, end).replace('_', ' ').trim().ifEmpty { null }
     }
 
+    /** [raw] as a file name part: NFC, unsafe characters as single "_", at most [maxChars] and [MAX_NAME_PART_BYTES]. */
+    private fun safeNamePart(raw: String, maxChars: Int): String =
+        capUtf8(
+            java.text.Normalizer.normalize(raw, java.text.Normalizer.Form.NFC)
+                .replace(SAFE_NAME_REGEX, "_")
+                .replace(Regex("_+"), "_")
+                .trim('_', '-')
+                .take(maxChars)
+        ).trim('_', '-')
+
+    /** Cuts [s] at a code point boundary so it takes at most [MAX_NAME_PART_BYTES] bytes in UTF-8. */
+    private fun capUtf8(s: String): String {
+        var bytes = 0
+        var end = 0
+        while (end < s.length) {
+            val cp = s.codePointAt(end)
+            val len = String(Character.toChars(cp)).toByteArray(Charsets.UTF_8).size
+            if (bytes + len > MAX_NAME_PART_BYTES) break
+            bytes += len
+            end += Character.charCount(cp)
+        }
+        return s.substring(0, end)
+    }
+
     /** File name part for an imported pack, "" when there is no usable pack name. */
     private fun packFileNamePart(packName: String?): String {
-        val safe = packName.orEmpty()
-            .replace(SAFE_NAME_REGEX, "_")
-            .replace(Regex("_+"), "_")
-            .trim('_', '-')
-            .take(MAX_PACK_LENGTH)
+        val safe = safeNamePart(packName.orEmpty(), MAX_PACK_LENGTH)
         return if (safe.isEmpty()) "" else "$safe$PACK_DELIMITER"
     }
 
@@ -587,7 +608,7 @@ object LocalMediaManager {
                         else -> displayName.substringAfterLast('.', "gif")
                     }.lowercase()
                     val rawName = displayName.substringBeforeLast('.')
-                    val safeBase = packPart + rawName.replace(SAFE_NAME_REGEX, "_").ifEmpty { "media" }
+                    val safeBase = packPart + capUtf8(rawName.replace(SAFE_NAME_REGEX, "_")).ifEmpty { "media" }
                     val kindPrefix = when (targetKind) {
                         Contract.KIND_MEME -> "meme"
                         Contract.KIND_ANIMATED_EMOJI -> "emoji"
@@ -671,7 +692,7 @@ object LocalMediaManager {
                             // skip macOS resource fork junk, it is not media
                             if (!entry.isDirectory && ext in SUPPORTED_EXTENSIONS && !name.startsWith("__MACOSX/")) {
                                 val rawBase = name.substringAfterLast('/').substringBeforeLast('.')
-                                val safeBase = packPart + rawBase.replace(SAFE_NAME_REGEX, "_").ifEmpty { "pack" }
+                                val safeBase = packPart + capUtf8(rawBase.replace(SAFE_NAME_REGEX, "_")).ifEmpty { "pack" }
                                 val entryLower = name.lowercase()
                                 val kindPrefix = when {
                                     entryLower.contains("meme") -> "meme"
