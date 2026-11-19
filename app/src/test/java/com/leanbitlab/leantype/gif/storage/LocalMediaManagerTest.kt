@@ -195,6 +195,36 @@ class LocalMediaManagerTest {
     }
 
     @Test
+    fun testAccentedPackNamesAndTitlesAreKept() {
+        val ctx = testContext(tempFolder.newFolder("accent_root"))
+        val mediaDir = LocalMediaManager.getMediaDir(ctx)
+        val file = File(mediaDir, "sticker_cat_1700000_7.webp").also { it.writeBytes(ByteArray(64) { 1 }) }
+        LocalMediaManager.markDirty()
+
+        val inPack = LocalMediaManager.setPack(file, "Reações")
+        assertNotNull(inPack)
+        assertEquals("Reações", LocalMediaManager.getPackName(inPack!!))
+
+        val renamed = LocalMediaManager.renameTitle(inPack, "Coração ñandú")
+        assertNotNull(renamed)
+        assertEquals("Coração ñandú", LocalMediaManager.getTitle(renamed!!))
+        assertEquals("Reações", LocalMediaManager.getPackName(renamed))
+
+        // decomposed input (a + combining tilde) is stored like the composed one
+        val nfd = LocalMediaManager.setPack(renamed, "Reac\u0327a\u0303o")
+        assertEquals("Reação", LocalMediaManager.getPackName(nfd!!))
+
+        // long non-Latin names stay within the file name byte limit
+        val long = LocalMediaManager.setPack(nfd, "表情".repeat(20))
+        assertNotNull(long)
+        assertTrue(long!!.name.toByteArray(Charsets.UTF_8).size <= 255)
+
+        // thumbnail names stay ASCII for ThumbnailProvider
+        val thumb = LocalMediaManager.getItems(ctx).single().previewUri.substringAfterLast('/')
+        assertTrue(thumb, thumb.matches(Regex("^[a-zA-Z0-9_-]+\\.(webp|jpg|jpeg|png|gif)$")))
+    }
+
+    @Test
     fun testOldPathAndThumbNameStillResolveAfterMoves() {
         val ctx = testContext(tempFolder.newFolder("alias_root"))
         val mediaDir = LocalMediaManager.getMediaDir(ctx)
