@@ -28,13 +28,23 @@ jobs:
       - name: Decode Keystore
         env:
           RELEASE_KEYSTORE: ${{ secrets.RELEASE_KEYSTORE }}
-        if: ${{ env.RELEASE_KEYSTORE != '' }}
+          RELEASE_KEY_ALIAS: ${{ secrets.RELEASE_KEY_ALIAS }}
+          RELEASE_KEY_PASSWORD: ${{ secrets.RELEASE_KEY_PASSWORD }}
+          RELEASE_STORE_PASSWORD: ${{ secrets.RELEASE_STORE_PASSWORD }}
         run: |
-          echo "${{ secrets.RELEASE_KEYSTORE }}" | base64 -d > plugin-release.jks
-          echo "keyAlias=${{ secrets.RELEASE_KEY_ALIAS }}" > keystore.properties
-          echo "keyPassword=${{ secrets.RELEASE_KEY_PASSWORD }}" >> keystore.properties
-          echo "storeFile=plugin-release.jks" >> keystore.properties
-          echo "storePassword=${{ secrets.RELEASE_STORE_PASSWORD }}" >> keystore.properties
+          for name in RELEASE_KEYSTORE RELEASE_KEY_ALIAS RELEASE_KEY_PASSWORD RELEASE_STORE_PASSWORD; do
+            if [ -z "${!name}" ]; then
+              echo "::error::Secret $name is missing, refusing to build a release"
+              exit 1
+            fi
+          done
+          printf '%s' "$RELEASE_KEYSTORE" | base64 -d > plugin-release.jks
+          {
+            printf 'keyAlias=%s\n' "$RELEASE_KEY_ALIAS"
+            printf 'keyPassword=%s\n' "$RELEASE_KEY_PASSWORD"
+            printf 'storeFile=plugin-release.jks\n'
+            printf 'storePassword=%s\n' "$RELEASE_STORE_PASSWORD"
+          } > keystore.properties
 
       - name: Make Gradle executable
         run: chmod +x ./gradlew
@@ -42,6 +52,19 @@ jobs:
 
       - name: Build Release APK
         run: ./gradlew :app:assembleRelease
+
+      - name: Verify Signing Certificate
+        env:
+          EXPECTED_CERT_SHA256: 01cfc72120c539ec4cc846cd70d25f83e3fc694d8bdcd2211454a8c993c4f5a3
+        run: |
+          apksigner=$(ls "$ANDROID_HOME"/build-tools/*/apksigner | sort -V | tail -n 1)
+          certs=$("$apksigner" verify --print-certs app/build/outputs/apk/release/gif_plugin.apk)
+          actual=$(printf '%s\n' "$certs" | grep 'certificate SHA-256 digest' | awk '{print $NF}' | sort -u)
+          if [ "$actual" != "$EXPECTED_CERT_SHA256" ]; then
+            echo "::error::APK is not signed with the release certificate (got: ${actual:-none})"
+            exit 1
+          fi
+          echo "Signed with the release certificate"
 
       - name: Create GitHub Release
         uses: softprops/action-gh-release@v2
