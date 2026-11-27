@@ -9,6 +9,7 @@ def keystoreProperties = new Properties()
 if (keystorePropertiesFile.exists()) {
     keystoreProperties.load(new FileInputStream(keystorePropertiesFile))
 }
+def hasReleaseKey = keystoreProperties['storeFile'] != null && rootProject.file(keystoreProperties['storeFile']).exists()
 
 android {
     namespace 'com.leanbitlab.leantype.gif'
@@ -23,7 +24,7 @@ android {
     }
 
     signingConfigs {
-        if (keystorePropertiesFile.exists() && keystoreProperties['storeFile'] != null && rootProject.file(keystoreProperties['storeFile']).exists()) {
+        if (hasReleaseKey) {
             release {
                 keyAlias keystoreProperties['keyAlias']
                 keyPassword keystoreProperties['keyPassword']
@@ -39,10 +40,8 @@ android {
         release {
             minifyEnabled true
             proguardFiles getDefaultProguardFile('proguard-android-optimize.txt'), 'proguard-rules.pro'
-            if (keystorePropertiesFile.exists() && keystoreProperties['storeFile'] != null && rootProject.file(keystoreProperties['storeFile']).exists()) {
+            if (hasReleaseKey) {
                 signingConfig signingConfigs.release
-            } else {
-                signingConfig signingConfigs.debug
             }
         }
         debug {
@@ -67,6 +66,14 @@ android {
     }
     kotlinOptions {
         jvmTarget = '1.8'
+    }
+}
+
+// Never publish a release APK without the release key: the keyboard only trusts that certificate.
+gradle.taskGraph.whenReady { graph ->
+    def packagesRelease = graph.allTasks.any { it.project == project && it.name in ['packageRelease', 'packageReleaseBundle'] }
+    if (packagesRelease && !hasReleaseKey) {
+        throw new GradleException('Release signing key missing: set up keystore.properties (see keystore.properties.example). Debug builds do not need it.')
     }
 }
 
